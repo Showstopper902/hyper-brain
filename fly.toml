@@ -1,0 +1,19 @@
+app = "hyper-brain"
+primary_region = "ord"
+
+[build]
+
+[env]
+PORT = "8080"
+POLL_SECONDS = "3"
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_start_machines = true
+auto_stop_machines = false
+min_machines_running = 1
+
+[processes]
+web = "uvicorn app.main:app --host 0.0.0.0 --port 8080"
+worker = "python -m app.worker"
