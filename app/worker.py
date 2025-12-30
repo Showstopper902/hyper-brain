@@ -12,8 +12,9 @@ def dispatch_one_job():
             cur.execute(
                 """
                 update public.jobs
-                   set status='DISPATCHED',
-                       assigned_worker_id=%s
+                   set status='RUNNING',
+                       assigned_worker_id=%s,
+                       started_at=now()
                  where job_id = (
                     select job_id
                       from public.jobs
@@ -41,7 +42,7 @@ def run():
         user = job["username"]
         model = job["model_name"]
         jtype = job.get("job_type", "TRAIN")
-        print(f"[worker] dispatched {job_id} {jtype} {user}/{model} -> {DEFAULT_WORKER_ID}")
+        print(f"[worker] claimed {job_id} {jtype} {user}/{model} -> {DEFAULT_WORKER_ID}")
 
         # IMPORTANT: submit+return means we do NOT mark SUCCEEDED here.
         # Next phase: actually provision Hyperbolic worker(s) and notify them.
