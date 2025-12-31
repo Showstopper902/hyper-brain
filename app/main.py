@@ -2,9 +2,8 @@
 import os
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
-from psycopg import sql
 
 from app.db import get_conn
 
@@ -21,8 +20,7 @@ def _executor_token_expected() -> str:
     return tok
 
 
-def require_executor_auth(authorization: Optional[str] = None):
-    # FastAPI injects headers via parameter name "authorization"
+def require_executor_auth(authorization: Optional[str] = Header(default=None)):
     expected = _executor_token_expected()
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
@@ -102,7 +100,7 @@ def create_infer_job(req: InferJobRequest):
 def executor_claim(req: ClaimRequest):
     """
     Claim the oldest RUNNING job for assigned_worker_id that doesn't have executor_id yet.
-    This matches your SQL approach: FOR UPDATE SKIP LOCKED, oldest first.
+    Uses FOR UPDATE SKIP LOCKED to safely distribute work among executors.
     """
     with get_conn() as conn:
         with conn.cursor() as cur:
@@ -142,12 +140,12 @@ def executor_claim(req: ClaimRequest):
 def executor_complete(req: CompleteRequest):
     """
     Mark SUCCEEDED / FAILED and write finished_at + error_text.
+    Guardrail: only the claiming executor can complete the job (executor_id must match).
     """
     new_status = "SUCCEEDED" if req.ok else "FAILED"
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-            # Guardrail: only the claiming executor can complete it
             cur.execute(
                 """
                 update public.jobs
