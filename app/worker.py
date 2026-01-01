@@ -1,360 +1,314 @@
-import os
-import time
+# app/worker.py
 import json
 import math
-import shlex
-import tempfile
+import os
+import re
 import subprocess
-import threading
-from datetime import datetime, timezone
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg
+from app.db import get_conn
 
-
-# ----------------------------
-# Logging
-# ----------------------------
-def log(msg: str):
-    # Fly logs will show this under your worker process
-    print(f"[brain-worker] {msg}", flush=True)
-
-
-# ----------------------------
-# DB helpers
-# ----------------------------
-DB_DSN = os.getenv("DATABASE_URL") or os.getenv("DB_DSN")
-if not DB_DSN:
-    raise RuntimeError("Missing DATABASE_URL (or DB_DSN)")
+LOG_PREFIX = "[brain-worker]"
 
 ASSIGNED_WORKER_ID = os.getenv("ASSIGNED_WORKER_ID", "hyperbolic-pool")
 
-DISPATCH_POLL_SECONDS = float(os.getenv("DISPATCH_POLL_SECONDS", "2"))
-AUTOSCALE_POLL_SECONDS = float(os.getenv("AUTOSCALE_POLL_SECONDS", "12"))
-
-# your scaling rule
+# Autoscale rule: 1 VM can chew through up to 250 unclaimed RUNNING jobs sequentially.
 BACKLOG_PER_VM = int(os.getenv("BACKLOG_PER_VM", "250"))
+POLL_SECONDS = float(os.getenv("WORKER_POLL_SECONDS", "4"))
 
-# Hyperbolic constraints (for now: VM + 1 GPU)
-HYP_INSTANCE_TYPE = os.getenv("HYP_INSTANCE_TYPE", "virtual-machine")
-HYP_GPU_COUNT = int(os.getenv("HYP_GPU_COUNT", "1"))
+# Prefer region (we only pass it if CLI supports it)
+PREFERRED_REGION = os.getenv("HYPERBOLIC_REGION", "us-central-1")
 
-# optional safety: if you ever have other instances in the account
-# set this to 1 to allow terminating instances; otherwise it will only scale up.
-ALLOW_TERMINATE = os.getenv("ALLOW_TERMINATE", "1") == "1"
-
-# Hyperbolic API key secret on Fly
-HYPERBOLIC_API_KEY = (
-    os.getenv("HYPERBOLIC_API_KEY")
-    or os.getenv("HYPERBOLIC_KEY")
-    or os.getenv("HYPERBOLIC_TOKEN")
-)
-if not HYPERBOLIC_API_KEY:
-    log("WARNING: Missing HYPERBOLIC_API_KEY (or HYPERBOLIC_KEY/HYPERBOLIC_TOKEN). Autoscaler will fail auth.")
+# Always VM, always smallest GPU count (1 job per VM for now)
+RENT_INSTANCE_TYPE = "virtual-machine"
+RENT_GPU_COUNT = 1
 
 
-def db_connect():
-    return psycopg.connect(DB_DSN)
+def log(msg: str) -> None:
+    print(f"{LOG_PREFIX} {msg}", flush=True)
 
 
-def utc_now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def count_backlog(conn) -> int:
+def _hyper_env() -> Dict[str, str]:
     """
-    backlog = RUNNING jobs assigned to our worker pool but not yet claimed by an executor
-            = status='RUNNING' AND assigned_worker_id=... AND executor_id IS NULL
+    Make Hyperbolic CLI auth/config deterministic on Fly:
+    force config into writable /tmp.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT COUNT(*)
-            FROM jobs
-            WHERE status='RUNNING'
-              AND assigned_worker_id=%s
-              AND executor_id IS NULL
-            """,
-            (ASSIGNED_WORKER_ID,),
-        )
-        return int(cur.fetchone()[0])
+    env = os.environ.copy()
+    env.setdefault("HOME", "/tmp/hyperbolic_home")
+    env.setdefault("XDG_CONFIG_HOME", "/tmp/hyperbolic_home/.config")
+    env.setdefault("XDG_DATA_HOME", "/tmp/hyperbolic_home/.local/share")
+    # Create dirs is handled by worker loop before first CLI call.
+    return env
 
 
-def claim_next_queued_job(conn):
+def _run(cmd: List[str], timeout: int = 30) -> Tuple[int, str, str]:
     """
-    Move one QUEUED job to RUNNING and assign to the worker pool.
+    Run a command and capture stdout/stderr.
     """
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            WITH next_job AS (
-              SELECT job_id
-              FROM jobs
-              WHERE status='QUEUED'
-              ORDER BY created_at ASC
-              LIMIT 1
-              FOR UPDATE SKIP LOCKED
-            )
-            UPDATE jobs
-            SET status='RUNNING',
-                assigned_worker_id=%s,
-                started_at=NOW()
-            WHERE job_id IN (SELECT job_id FROM next_job)
-            RETURNING job_id, job_type, username, model_name, input_key
-            """,
-            (ASSIGNED_WORKER_ID,),
-        )
-        row = cur.fetchone()
-        if row:
-            conn.commit()
-            return {
-                "job_id": row[0],
-                "job_type": row[1],
-                "username": row[2],
-                "model_name": row[3],
-                "input_key": row[4],
-            }
-        conn.rollback()
-        return None
-
-
-# ----------------------------
-# Hyperbolic CLI helpers
-# ----------------------------
-def run_cmd(cmd, *, env=None, input_text=None, timeout=60):
-    """
-    Run a command and return (rc, stdout, stderr).
-    """
+    env = _hyper_env()
     try:
         p = subprocess.run(
             cmd,
-            input=input_text,
-            text=True,
             capture_output=True,
+            text=True,
             env=env,
             timeout=timeout,
         )
         return p.returncode, p.stdout or "", p.stderr or ""
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
     except Exception as e:
-        return 999, "", f"{type(e).__name__}: {e}"
+        return 125, "", f"exception: {e!r}"
 
 
-def ensure_hyperbolic_auth() -> dict:
+def _extract_json(text: str) -> Any:
     """
-    Hyperbolic CLI needs a config file. On Fly, assume it's not there.
-    We create an isolated HOME and run auth set-key in multiple compatible ways.
-    Returns env override dict you should pass to all hyperbolic subprocess calls.
+    Hyperbolic CLI sometimes prints non-JSON lines.
+    Extract the first JSON object/array substring and parse it.
     """
-    if not HYPERBOLIC_API_KEY:
-        raise RuntimeError("No HYPERBOLIC_API_KEY env var found.")
+    s = text.strip()
+    if not s:
+        raise ValueError("empty output")
 
-    # Put Hyperbolic CLI config in a stable path in the container.
-    # /tmp is fine because we re-auth on each worker start anyway.
-    home_dir = "/tmp/hyperbolic_home"
-    os.makedirs(home_dir, exist_ok=True)
+    # Fast path
+    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
+        return json.loads(s)
 
-    env = os.environ.copy()
-    env["HOME"] = home_dir
-
-    # Try multiple auth methods to be compatible across hyperbolic-cli versions.
-    attempts = [
-        # common cobra style: positional arg
-        (["hyperbolic", "auth", "set-key", HYPERBOLIC_API_KEY], None),
-        # flag variants
-        (["hyperbolic", "auth", "set-key", "--api-key", HYPERBOLIC_API_KEY], None),
-        (["hyperbolic", "auth", "set-key", "--key", HYPERBOLIC_API_KEY], None),
-        # stdin (some CLIs prompt)
-        (["hyperbolic", "auth", "set-key"], HYPERBOLIC_API_KEY + "\n"),
-        # older/alternate syntax (your error text mentioned it)
-        (["hyperbolic", "auth", HYPERBOLIC_API_KEY], None),
-    ]
-
-    last = None
-    for cmd, stdin in attempts:
-        rc, out, err = run_cmd(cmd, env=env, input_text=stdin, timeout=45)
-        last = (cmd, rc, out, err)
-        if rc == 0:
-            # verify with auth status (best-effort)
-            rc2, out2, err2 = run_cmd(["hyperbolic", "auth", "status"], env=env, timeout=20)
-            log(f"hyperbolic auth OK (rc={rc}); status_rc={rc2}")
-            return env
-
-    # If we got here, auth failed
-    cmd, rc, out, err = last
-    raise RuntimeError(
-        "Hyperbolic auth failed.\n"
-        f"cmd={shlex.join(cmd)} rc={rc}\n"
-        f"stdout={out[:400]!r}\n"
-        f"stderr={err[:400]!r}"
-    )
+    # Try to find first JSON object/array
+    m = re.search(r"(\{.*\}|\[.*\])", s, flags=re.DOTALL)
+    if not m:
+        raise ValueError("no JSON object/array found in output")
+    blob = m.group(1)
+    return json.loads(blob)
 
 
-def hyperbolic_instances_json(hyp_env: dict):
-    rc, out, err = run_cmd(["hyperbolic", "instances", "--json"], env=hyp_env, timeout=45)
+def hyperbolic_ensure_auth() -> bool:
+    """
+    Ensure CLI is authenticated. We always run set-key because Fly machines are ephemeral
+    and the CLI otherwise errors with "config file not found".
+    """
+    api_key = os.getenv("HYPERBOLIC_API_KEY", "").strip()
+    if not api_key:
+        log("autoscaler error: HYPERBOLIC_API_KEY is missing/empty in env")
+        return False
 
-    # Some failures still return rc=0 but output is error text
-    out_stripped = (out or "").strip()
-    if not out_stripped:
-        raise RuntimeError(f"hyperbolic instances --json returned empty output. stderr={err[:300]!r}")
+    # Ensure writable dirs exist
+    env = _hyper_env()
+    os.makedirs(env["HOME"], exist_ok=True)
+    os.makedirs(env["XDG_CONFIG_HOME"], exist_ok=True)
+    os.makedirs(env["XDG_DATA_HOME"], exist_ok=True)
+
+    rc, out, err = _run(["hyperbolic", "auth", "set-key", api_key], timeout=15)
+    if rc != 0:
+        log(f"autoscaler error: hyperbolic auth set-key failed rc={rc} stdout={out!r} stderr={err!r}")
+        return False
+    return True
+
+
+def hyperbolic_instances() -> List[Dict[str, Any]]:
+    """
+    Return list of instances from CLI JSON.
+    """
+    rc, out, err = _run(["hyperbolic", "instances", "--json"], timeout=20)
+    if rc != 0:
+        raise RuntimeError(f"hyperbolic instances rc={rc} stdout={out} stderr={err}")
 
     try:
-        data = json.loads(out_stripped)
-        return data
+        data = _extract_json(out)
     except Exception as e:
         raise RuntimeError(
-            "hyperbolic instances --json returned non-JSON output.\n"
-            f"stdout={out_stripped[:400]!r}\n"
-            f"stderr={err[:400]!r}\n"
-            f"parse_err={e}"
+            f"hyperbolic instances --json returned non-JSON output. stdout={out!r} stderr={err!r} parse_err={e}"
         )
 
+    # Normalize to list
+    if isinstance(data, dict):
+        # Some CLIs wrap as {"instances":[...]}
+        if "instances" in data and isinstance(data["instances"], list):
+            return data["instances"]
+        return [data]
+    if isinstance(data, list):
+        return data
+    raise RuntimeError(f"unexpected instances JSON type: {type(data)}")
 
-def extract_active_instances(instances_payload):
+
+def _instance_is_active(inst: Dict[str, Any]) -> bool:
     """
-    Be defensive: payload might be a list or a dict with 'instances'.
+    Best-effort filter: count instances that are not terminated.
+    We don't assume exact schema; we check common fields.
     """
-    if isinstance(instances_payload, list):
-        inst_list = instances_payload
-    elif isinstance(instances_payload, dict):
-        inst_list = instances_payload.get("instances") or instances_payload.get("data") or []
-        if not isinstance(inst_list, list):
-            inst_list = []
-    else:
-        inst_list = []
-
-    active = []
-    for inst in inst_list:
-        if not isinstance(inst, dict):
-            continue
-        status = str(inst.get("status") or "").lower()
-        # treat these as "active enough"
-        if status in ("running", "active", "ready", "provisioning"):
-            active.append(inst)
-        elif status == "" and inst.get("id"):
-            # if status missing, assume active (better than scaling wrong)
-            active.append(inst)
-
-    return active
+    status = str(inst.get("status") or inst.get("state") or "").lower()
+    if not status:
+        return True  # unknown => count it rather than undercount
+    if "terminat" in status or status in {"dead", "stopped"}:
+        return False
+    return True
 
 
-def instance_id(inst: dict) -> str:
-    return str(inst.get("id") or inst.get("instance_id") or "")
+def _instance_id(inst: Dict[str, Any]) -> Optional[str]:
+    for k in ("id", "instance_id", "instanceId", "instanceID"):
+        v = inst.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
 
 
-def rent_one_vm(hyp_env: dict):
+def _rent_supports_flag(flag: str) -> bool:
+    """
+    Detect optional flags by checking help text (safe to call; fast).
+    """
+    rc, out, err = _run(["hyperbolic", "rent", "ondemand", "--help"], timeout=10)
+    help_text = (out or "") + "\n" + (err or "")
+    return flag in help_text
+
+
+def hyperbolic_rent_vm() -> None:
+    """
+    Rent a new on-demand VM with minimal GPUs.
+    Prefer us-central-1 IF the CLI supports a region flag.
+    """
     cmd = [
         "hyperbolic",
         "rent",
         "ondemand",
         "--instance-type",
-        HYP_INSTANCE_TYPE,
+        RENT_INSTANCE_TYPE,
         "--gpu-count",
-        str(HYP_GPU_COUNT),
+        str(RENT_GPU_COUNT),
     ]
-    rc, out, err = run_cmd(cmd, env=hyp_env, timeout=180)
+
+    # Only add region if the CLI actually supports it
+    # (avoids hard failing on unknown flags).
+    for candidate in ("--region", "--location", "--datacenter", "--data-center"):
+        if _rent_supports_flag(candidate):
+            cmd += [candidate, PREFERRED_REGION]
+            break
+
+    rc, out, err = _run(cmd, timeout=120)
     if rc != 0:
-        raise RuntimeError(f"rent failed rc={rc} stdout={out[:400]!r} stderr={err[:400]!r}")
-    log(f"rented VM (stdout_head={out.strip()[:200]!r})")
+        raise RuntimeError(f"rent failed rc={rc} stdout={out!r} stderr={err!r}")
+
+    log(f"rented VM ok. stdout_head={out[:300]!r} stderr_head={err[:300]!r}")
 
 
-def terminate_vm(hyp_env: dict, inst_id: str):
-    if not inst_id:
-        return
-    rc, out, err = run_cmd(["hyperbolic", "terminate", inst_id], env=hyp_env, timeout=60)
+def hyperbolic_terminate(instance_id: str) -> None:
+    rc, out, err = _run(["hyperbolic", "terminate", instance_id], timeout=60)
     if rc != 0:
-        raise RuntimeError(f"terminate {inst_id} failed rc={rc} stdout={out[:300]!r} stderr={err[:300]!r}")
-    log(f"terminated VM {inst_id} (stdout_head={out.strip()[:200]!r})")
+        raise RuntimeError(f"terminate {instance_id} failed rc={rc} stdout={out!r} stderr={err!r}")
+    log(f"terminated instance_id={instance_id}")
 
 
-# ----------------------------
-# Loops
-# ----------------------------
-def dispatch_loop():
-    log("dispatcher loop starting")
-    conn = db_connect()
-    try:
-        while True:
-            job = claim_next_queued_job(conn)
-            if job:
-                log(f"dispatched job_id={job['job_id']} type={job['job_type']} user={job['username']} model={job['model_name']}")
-            time.sleep(DISPATCH_POLL_SECONDS)
-    except Exception as e:
-        log(f"dispatcher error: {type(e).__name__}: {e}")
-        raise
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+def db_backlog_and_running() -> Tuple[int, int]:
+    """
+    backlog = RUNNING jobs where executor_id IS NULL (and assigned to our worker pool)
+    running_total = all RUNNING jobs
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                select count(*)::int as c
+                from public.jobs
+                where status='RUNNING'
+                  and executor_id is null
+                  and assigned_worker_id = %s
+                """,
+                (ASSIGNED_WORKER_ID,),
+            )
+            backlog = cur.fetchone()["c"]
+
+            cur.execute(
+                """
+                select count(*)::int as c
+                from public.jobs
+                where status='RUNNING'
+                """
+            )
+            running_total = cur.fetchone()["c"]
+
+    return backlog, running_total
 
 
-def autoscale_loop():
-    log("autoscaler loop starting")
-    hyp_env = None
-    # authenticate once per worker start (safe even if already authed)
-    try:
-        hyp_env = ensure_hyperbolic_auth()
-    except Exception as e:
-        log(f"autoscaler error: {e}")
-        # keep looping; maybe secrets not set yet
-        hyp_env = None
-
-    conn = db_connect()
-    try:
-        while True:
-            try:
-                backlog = count_backlog(conn)
-                want_vms = 0 if backlog == 0 else int(math.ceil(backlog / BACKLOG_PER_VM))
-
-                if hyp_env is None:
-                    # retry auth periodically
-                    hyp_env = ensure_hyperbolic_auth()
-
-                inst_payload = hyperbolic_instances_json(hyp_env)
-                active = extract_active_instances(inst_payload)
-                have_vms = len(active)
-
-                log(f"backlog={backlog} want_vms={want_vms} have_vms={have_vms}")
-
-                # scale up
-                if want_vms > have_vms:
-                    for _ in range(want_vms - have_vms):
-                        rent_one_vm(hyp_env)
-
-                # scale down (optional but matches your "no backlog=no instances")
-                if ALLOW_TERMINATE and want_vms < have_vms:
-                    # terminate extras (oldest-first if we can sort)
-                    # best-effort: if created_at exists, use it; else just slice.
-                    def created_key(i):
-                        v = i.get("created_at") or i.get("createdAt") or ""
-                        return str(v)
-
-                    active_sorted = sorted(active, key=created_key)
-                    to_kill = active_sorted[: (have_vms - want_vms)]
-                    for inst in to_kill:
-                        terminate_vm(hyp_env, instance_id(inst))
-
-            except Exception as e:
-                log(f"autoscaler error: {e}")
-
-            time.sleep(AUTOSCALE_POLL_SECONDS)
-
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+def promote_queued_to_running(limit: int = 25) -> int:
+    """
+    Optional: move QUEUED -> RUNNING so executors can claim.
+    Safe if you already do it elsewhere; it just becomes a no-op.
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                with picked as (
+                    select job_id
+                    from public.jobs
+                    where status='QUEUED'
+                    order by created_at asc
+                    limit %s
+                    for update skip locked
+                )
+                update public.jobs j
+                set status='RUNNING',
+                    started_at=coalesce(started_at, now()),
+                    assigned_worker_id=coalesce(assigned_worker_id, %s)
+                from picked
+                where j.job_id = picked.job_id
+                returning j.job_id
+                """,
+                (limit, ASSIGNED_WORKER_ID),
+            )
+            rows = cur.fetchall()
+            return len(rows)
 
 
-def main():
-    # run both loops
-    t1 = threading.Thread(target=dispatch_loop, daemon=True)
-    t2 = threading.Thread(target=autoscale_loop, daemon=True)
-    t1.start()
-    t2.start()
+def main() -> None:
+    log(f"worker start: ASSIGNED_WORKER_ID={ASSIGNED_WORKER_ID} BACKLOG_PER_VM={BACKLOG_PER_VM}")
 
-    # keep process alive
     while True:
-        time.sleep(60)
+        try:
+            # 1) Promote queued -> running (if applicable)
+            promoted = promote_queued_to_running()
+            if promoted:
+                log(f"promoted queued->running: {promoted}")
+
+            # 2) Compute backlog & desired VM count
+            backlog, running_total = db_backlog_and_running()
+            want_vms = 0 if backlog == 0 else int(math.ceil(backlog / BACKLOG_PER_VM))
+
+            # 3) Hyperbolic autoscale (only if authenticated)
+            if not hyperbolic_ensure_auth():
+                time.sleep(POLL_SECONDS)
+                continue
+
+            instances = hyperbolic_instances()
+            active = [i for i in instances if _instance_is_active(i)]
+            have_vms = len(active)
+
+            log(f"backlog={backlog} want_vms={want_vms} have_vms={have_vms}")
+
+            if want_vms > have_vms:
+                to_add = want_vms - have_vms
+                for _ in range(to_add):
+                    hyperbolic_rent_vm()
+
+            elif want_vms < have_vms:
+                # Safety: only scale down if there are *no* RUNNING jobs at all.
+                if running_total == 0:
+                    to_kill = have_vms - want_vms
+                    killed = 0
+                    for inst in active:
+                        if killed >= to_kill:
+                            break
+                        iid = _instance_id(inst)
+                        if iid:
+                            hyperbolic_terminate(iid)
+                            killed += 1
+                else:
+                    log(f"scale-down skipped (running_total={running_total} > 0)")
+
+        except Exception as e:
+            log(f"autoscaler error: {e}")
+
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
