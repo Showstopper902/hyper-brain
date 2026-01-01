@@ -1,20 +1,29 @@
-# ---------- build hyperbolic CLI (PINNED) ----------
-FROM golang:1.24.3 AS hypercli
-WORKDIR /tmp
+# ---------- build hyperbolic CLI (PINNED COMMIT, Go 1.24.x) ----------
+FROM golang:1.24 AS hypercli
+WORKDIR /src
 
-# Pin to a known release tag (don’t use @latest)
-RUN go install github.com/HyperbolicLabs/hyperbolic-cli@v0.0.3
+# git is needed to pin an exact commit
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# Pin to a specific commit for determinism (from the module pseudo-version you saw)
+ARG HYPERBOLIC_CLI_COMMIT=5d3f40498c8c
+
+RUN git clone https://github.com/HyperbolicLabs/hyperbolic-cli.git . \
+ && git checkout "${HYPERBOLIC_CLI_COMMIT}" \
+ && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/hyperbolic .
 
 # ---------- runtime ----------
 FROM python:3.11-slim
 
-# system deps (ssh + curl + jq)
+# system deps (ssh + curl + jq) used by your worker
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl jq openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # copy hyperbolic CLI binary
-COPY --from=hypercli /go/bin/hyperbolic /usr/local/bin/hyperbolic
+COPY --from=hypercli /out/hyperbolic /usr/local/bin/hyperbolic
 
 WORKDIR /app
 
