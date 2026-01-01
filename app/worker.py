@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 from app.db import get_conn
 
@@ -26,7 +26,7 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "3"))
 BACKLOG_PER_INSTANCE = int(os.getenv("BACKLOG_PER_INSTANCE", "250"))
 MAX_NEW_INSTANCES_PER_LOOP = int(os.getenv("MAX_NEW_INSTANCES_PER_LOOP", "2"))  # safety
 
-# VM preferences (current: 1 job per VM => start with 1 GPU; fallback 2 then 4)
+# VM preferences: 1 job per VM => prefer 1 GPU, fallback 2 then 4
 GPU_COUNTS_TRY = [1, 2, 4]
 
 # Where to pull the executor loop script from
@@ -74,7 +74,6 @@ def run(
     if env_extra:
         env.update({k: v for k, v in env_extra.items() if v is not None})
 
-    # Critical on Fly: some tools fail if HOME is unwritable / missing.
     env.setdefault("HOME", "/tmp")
     env.setdefault("XDG_CONFIG_HOME", "/tmp/.config")
     env.setdefault("XDG_CACHE_HOME", "/tmp/.cache")
@@ -103,8 +102,7 @@ def run(
 def ensure_hyperbolic_auth() -> None:
     """
     Non-interactive Hyperbolic CLI auth inside Fly.
-    The earlier failure you saw is usually because the CLI can't write config
-    (HOME/XDG) or set-key invocation style differs. We handle both.
+    We pass key via env + attempt set-key in multiple non-interactive styles.
     """
     if not HYPERBOLIC_API_KEY:
         raise RuntimeError("Missing HYPERBOLIC_API_KEY (or HYPERBOLIC_API_TOKEN) in Fly secrets/env")
@@ -114,7 +112,7 @@ def ensure_hyperbolic_auth() -> None:
         "HYPERBOLIC_API_TOKEN": HYPERBOLIC_API_KEY,
     }
 
-    # Already authed?
+    # Check status first (non-fatal)
     p = run(["hyperbolic", "auth", "status"], check=False, env_extra=env_extra)
     status_text = (p.stdout + p.stderr).lower()
     if p.returncode == 0 and any(x in status_text for x in ("authenticated", "logged", "valid", "success")):
@@ -122,12 +120,12 @@ def ensure_hyperbolic_auth() -> None:
 
     errors: List[str] = []
 
-    # Try stdin prompt style
+    # stdin style
     p1 = run(["hyperbolic", "auth", "set-key"], input_text=HYPERBOLIC_API_KEY + "\n", check=False, env_extra=env_extra)
     if p1.returncode != 0:
-        errors.append(f"set-key (stdin) rc={p1.returncode} stderr={p1.stderr.strip()[:300]}")
+        errors.append(f"set-key(stdin) rc={p1.returncode} stderr={p1.stderr.strip()[:300]}")
 
-    # Try arg style: set-key <key>
+    # arg style
     if p1.returncode != 0:
         p2 = run(["hyperbolic", "auth", "set-key", HYPERBOLIC_API_KEY], check=False, env_extra=env_extra)
         if p2.returncode != 0:
@@ -135,7 +133,7 @@ def ensure_hyperbolic_auth() -> None:
         else:
             p1 = p2
 
-    # Try flag styles
+    # flag styles
     if p1.returncode != 0:
         for flag in ("--api-key", "--key"):
             p3 = run(["hyperbolic", "auth", "set-key", flag, HYPERBOLIC_API_KEY], check=False, env_extra=env_extra)
@@ -159,23 +157,94 @@ def ensure_hyperbolic_auth() -> None:
 
 
 # ----------------------------
+# JSON parsing helpers (FIX)
+# ----------------------------
+
+def _extract_json_payload(text: str) -> str:
+    """
+    Extract the first JSON object/array from a text blob that may include warnings/banners.
+    Returns "" if no JSON-looking payload exists.
+    """
+    if not text:
+        return ""
+    s = text.strip()
+    if not s:
+        return ""
+
+    # If it already starts with JSON, use it
+    if s[0] in "[{":
+        return s
+
+    # Otherwise find first JSON start
+    idx_obj = s.find("{")
+    idx_arr = s.find("[")
+    idxs = [i for i in (idx_obj, idx_arr) if i != -1]
+    if not idxs:
+        return ""
+    start = min(idxs)
+    return s[start:]
+
+
+def _parse_instances_json(stdout: str, stderr: str) -> List[dict]:
+    """
+    Tolerant parsing:
+      - empty => []
+      - prefer stdout else stderr
+      - strip junk before JSON
+      - accept {"instances":[...]} or [...]
+    """
+    primary = stdout.strip() if stdout and stdout.strip() else ""
+    secondary = stderr.strip() if stderr and stderr.strip() else ""
+
+    if not primary and not secondary:
+        # Some CLIs output nothing for "no instances"
+        return []
+
+    payload = _extract_json_payload(primary) or _extract_json_payload(secondary)
+    if not payload:
+        # still nothing JSON-like
+        head = (primary or secondary)[:400]
+        tail = (primary or secondary)[-400:]
+        raise RuntimeError(
+            "hyperbolic instances --json returned non-JSON output.\n"
+            f"HEAD:\n{head}\n\nTAIL:\n{tail}\n"
+        )
+
+    try:
+        data = json.loads(payload)
+    except Exception as e:
+        head = payload[:400]
+        tail = payload[-400:]
+        raise RuntimeError(
+            f"Failed to parse hyperbolic JSON: {e}\nHEAD:\n{head}\n\nTAIL:\n{tail}\n"
+        ) from None
+
+    if isinstance(data, dict) and isinstance(data.get("instances"), list):
+        return data["instances"]
+    if isinstance(data, list):
+        return data
+    return []
+
+
+# ----------------------------
 # Hyperbolic CLI helpers
 # ----------------------------
 
 def hyperbolic_instances_json() -> List[dict]:
     ensure_hyperbolic_auth()
-    p = run(["hyperbolic", "instances", "--json"], check=True)
-    try:
-        data = json.loads(p.stdout)
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse `hyperbolic instances --json`: {e}\nRAW:\n{p.stdout[:500]}") from None
 
-    # Some CLIs return {"instances":[...]} others return [...]
-    if isinstance(data, dict) and "instances" in data and isinstance(data["instances"], list):
-        return data["instances"]
-    if isinstance(data, list):
-        return data
-    return []
+    # Don't let run(check=True) hide useful output: we want stdout/stderr always
+    p = run(["hyperbolic", "instances", "--json"], check=False, timeout=30)
+
+    if p.returncode != 0:
+        raise RuntimeError(
+            "hyperbolic instances --json failed\n"
+            f"exit_code={p.returncode}\n"
+            + (f"STDOUT:\n{p.stdout}\n" if p.stdout else "")
+            + (f"STDERR:\n{p.stderr}\n" if p.stderr else "")
+        )
+
+    return _parse_instances_json(p.stdout or "", p.stderr or "")
 
 
 def hyperbolic_rent_vm(gpu_count: int) -> str:
@@ -183,27 +252,22 @@ def hyperbolic_rent_vm(gpu_count: int) -> str:
     cmd = ["hyperbolic", "rent", "ondemand", "--instance-type", "virtual-machine", "--gpu-count", str(gpu_count)]
     p = run(cmd, check=True, timeout=120)
 
-    # If CLI outputs JSON, use it
     out = (p.stdout or "").strip()
     if out.startswith("{") or out.startswith("["):
         try:
             j = json.loads(out)
-            # best-effort common keys
             for k in ("instance_id", "id", "rental_id"):
                 if isinstance(j, dict) and j.get(k):
                     return str(j[k])
         except Exception:
             pass
 
-    # Otherwise extract something that looks like an instance id
     m = re.search(r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", out, re.I)
     if m:
         return m.group(1)
 
-    # As a fallback, after rent, list instances and take newest "running"
     inst = hyperbolic_instances_json()
     if inst:
-        # pick the most recent by created_at if present
         inst_sorted = sorted(inst, key=lambda x: x.get("created_at", ""), reverse=True)
         iid = inst_sorted[0].get("id") or inst_sorted[0].get("instance_id")
         if iid:
@@ -240,16 +304,8 @@ def _write_ssh_keyfile() -> str:
 
 
 def _extract_ssh_info(instance: dict) -> Optional[SSHInfo]:
-    """
-    Best-effort extraction; Hyperbolic JSON schema can vary by version.
-    We support:
-      - instance["ssh_command"] like: "ssh -p 1234 root@1.2.3.4"
-      - instance["ssh"] fields like {"host":..., "port":..., "user":...}
-      - flat fields: host/ip + port + user/username
-    """
     ssh_cmd = instance.get("ssh_command") or instance.get("sshCommand") or ""
     if isinstance(ssh_cmd, str) and "ssh" in ssh_cmd and "@" in ssh_cmd:
-        # parse "-p PORT user@host"
         port = 22
         mport = re.search(r"-p\s+(\d+)", ssh_cmd)
         if mport:
@@ -280,18 +336,12 @@ def ssh_run(ssh: SSHInfo, script: str, *, timeout_s: int = 600) -> None:
     try:
         cmd = [
             "ssh",
-            "-i",
-            keyfile,
-            "-p",
-            str(ssh.port),
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
+            "-i", keyfile,
+            "-p", str(ssh.port),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
             f"{ssh.user}@{ssh.host}",
-            "bash",
-            "-lc",
-            script,
+            "bash", "-lc", script,
         ]
         p = run(cmd, check=False, timeout=timeout_s)
         if p.returncode != 0:
@@ -308,13 +358,6 @@ def ssh_run(ssh: SSHInfo, script: str, *, timeout_s: int = 600) -> None:
 
 
 def bootstrap_executor_vm(ssh: SSHInfo) -> None:
-    """
-    Installs:
-      - /data/secrets/b2.env
-      - /data/secrets/hyper_executor.env
-      - /data/bin/hyper_executor_loop.sh (from repo)
-      - systemd unit hyper-executor.service (enabled)
-    """
     if not EXECUTOR_TOKEN:
         raise RuntimeError("Missing EXECUTOR_TOKEN in Fly secrets/env (needed to write hyper_executor.env on VMs)")
     for k, v in {
@@ -326,13 +369,11 @@ def bootstrap_executor_vm(ssh: SSHInfo) -> None:
         if not v:
             raise RuntimeError(f"Missing {k} in Fly secrets/env (needed to write /data/secrets/b2.env on VMs)")
 
-    # All in one idempotent script
     remote = f"""
 set -euo pipefail
 
 sudo mkdir -p /data/secrets /data/bin
 
-# b2.env
 sudo bash -c 'cat > /data/secrets/b2.env <<EOF
 B2_SYNC={B2_SYNC}
 B2_BUCKET={B2_BUCKET}
@@ -343,7 +384,6 @@ AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}
 EOF'
 sudo chmod 600 /data/secrets/b2.env
 
-# hyper_executor.env
 sudo bash -c 'cat > /data/secrets/hyper_executor.env <<EOF
 EXECUTOR_TOKEN="{EXECUTOR_TOKEN}"
 BRAIN_URL="{BRAIN_URL}"
@@ -354,11 +394,9 @@ EXECUTOR_ID="exec-$(hostname)"
 EOF'
 sudo chmod 600 /data/secrets/hyper_executor.env
 
-# executor loop script
 sudo curl -fsSL "{EXECUTOR_LOOP_URL}" -o /data/bin/hyper_executor_loop.sh
 sudo chmod +x /data/bin/hyper_executor_loop.sh
 
-# systemd unit
 sudo tee /etc/systemd/system/hyper-executor.service >/dev/null <<'EOF'
 [Unit]
 Description=Hyperbolic GPU Executor Loop
@@ -387,9 +425,6 @@ sudo systemctl enable --now hyper-executor.service
 # ----------------------------
 
 def promote_queued_jobs(conn, *, limit: int = 500) -> int:
-    """
-    Promote QUEUED -> RUNNING (so autoscaler can see backlog as RUNNING/unclaimed).
-    """
     with conn.cursor() as cur:
         cur.execute(
             """
@@ -443,21 +478,13 @@ def desired_instance_count(backlog: int) -> int:
 
 
 def autoscale_once() -> None:
-    """
-    - Promote queued jobs to RUNNING (so backlog is measurable).
-    - If backlog==0 => ensure 0 instances (terminate all we can see).
-    - If backlog>0 => ensure ceil(backlog/250) instances.
-    - When scaling up: rent VM (1 GPU preferred) and bootstrap executor service via SSH.
-    """
     with get_conn() as conn:
         promoted = promote_queued_jobs(conn, limit=500)
         backlog = count_unclaimed_running(conn)
 
     desired = desired_instance_count(backlog)
 
-    # List current instances
     instances = hyperbolic_instances_json()
-    # We assume these are "ours" for now (per your current workflow).
     current = len(instances)
 
     log(f"promoted={promoted} backlog_unclaimed_running={backlog} desired_instances={desired} current_instances={current}")
@@ -465,9 +492,7 @@ def autoscale_once() -> None:
     if desired == current:
         return
 
-    # Scale down: terminate extras
     if desired < current:
-        # terminate oldest first if we can sort
         inst_sorted = sorted(instances, key=lambda x: x.get("created_at", ""))
         to_kill = inst_sorted[: (current - desired)]
         for inst in to_kill:
@@ -481,9 +506,8 @@ def autoscale_once() -> None:
                 log(f"terminate failed for {iid}: {e}")
         return
 
-    # Scale up: rent & bootstrap
     need = min(desired - current, MAX_NEW_INSTANCES_PER_LOOP)
-    for i in range(need):
+    for _ in range(need):
         rented_id = None
         last_err = None
         for g in GPU_COUNTS_TRY:
@@ -498,7 +522,6 @@ def autoscale_once() -> None:
         if not rented_id:
             raise RuntimeError(f"Failed to rent any VM size. last_err={last_err}")
 
-        # Find the instance details and bootstrap
         time.sleep(3)
         inst_list = hyperbolic_instances_json()
         inst = None
