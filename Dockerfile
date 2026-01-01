@@ -1,5 +1,5 @@
 # ---------- build hyperbolic CLI (pinned) ----------
-FROM golang:1.24.3 AS hypercli
+FROM golang:1.24 AS hypercli
 ARG HYPERBOLIC_CLI_VERSION=v0.0.3
 
 WORKDIR /src
