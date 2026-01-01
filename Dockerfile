@@ -1,32 +1,30 @@
-# ---------- build hyperbolic CLI (pinned) ----------
-FROM golang:1.24 AS hypercli
-ARG HYPERBOLIC_CLI_VERSION=v0.0.3
+# ---------- build hyperbolic CLI (PINNED) ----------
+FROM golang:1.22 AS hypercli
+WORKDIR /tmp
 
-WORKDIR /src
-# Clone the official CLI repo and build it
-RUN git clone --depth 1 --branch "${HYPERBOLIC_CLI_VERSION}" \
-      https://github.com/HyperbolicLabs/hyperbolic-cli.git /src/hyperbolic-cli
+# Key fix: allow Go to auto-download the required toolchain (instead of failing with GOTOOLCHAIN=local)
+ENV GOTOOLCHAIN=auto
 
-WORKDIR /src/hyperbolic-cli
-# Build a static-ish binary (best-effort; CGO disabled)
-RUN CGO_ENABLED=0 go build -o /out/hyperbolic .
+# Pin to a known release tag (do NOT use @latest)
+# v0.0.3 exists on HyperbolicLabs/hyperbolic-cli releases
+RUN go install github.com/HyperbolicLabs/hyperbolic-cli@v0.0.3
 
 
 # ---------- runtime ----------
 FROM python:3.11-slim
 
-# system deps (ssh + curl + jq)
+# system deps (ssh + curl + jq) used by your worker
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl jq openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
 # copy hyperbolic CLI binary
-COPY --from=hypercli /out/hyperbolic /usr/local/bin/hyperbolic
+COPY --from=hypercli /go/bin/hyperbolic /usr/local/bin/hyperbolic
 
 WORKDIR /app
 
 # install python deps
-COPY requirements.txt ./
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # app code
