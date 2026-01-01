@@ -1,30 +1,28 @@
-# ---------- build hyperbolic CLI (PINNED + correct Go toolchain) ----------
-ARG GO_VERSION=1.24.3
-FROM golang:${GO_VERSION} AS hypercli
-
+# ---------- build hyperbolic CLI (PINNED) ----------
+FROM golang:1.24.3 AS hypercli
 WORKDIR /tmp
 
-# Use the toolchain inside the image (now 1.24.3), don't try to auto-fetch
-ENV GOTOOLCHAIN=local
-
-# Pin to a known release tag (do NOT use @latest)
+# Pin to a known release tag (don’t use @latest)
 RUN go install github.com/HyperbolicLabs/hyperbolic-cli@v0.0.3
-
 
 # ---------- runtime ----------
 FROM python:3.11-slim
 
+# system deps (ssh + curl + jq)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates curl jq openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
+# copy hyperbolic CLI binary
 COPY --from=hypercli /go/bin/hyperbolic /usr/local/bin/hyperbolic
 
 WORKDIR /app
 
+# install python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# app code
 COPY . .
 
 ENV PYTHONUNBUFFERED=1
