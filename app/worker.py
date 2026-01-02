@@ -1,423 +1,398 @@
 # app/worker.py
 import json
 import logging
-import math
 import os
 import re
 import shlex
 import subprocess
-import sys
+import tempfile
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-import psycopg  # in requirements already
-
-from app.db import get_conn
+import psycopg
 
 LOG = logging.getLogger("brain-worker")
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s][brain-worker] %(message)s",
+)
 
-# ---- Hyperbolic Marketplace API ----
-HYP_API_KEY = os.getenv("HYPERBOLIC_API_KEY", "")
-# Marketplace API base that is actually documented/live (not the CLI ondemand endpoints)
-HYP_MARKET_BASE = os.getenv("HYPERBOLIC_MARKETPLACE_BASE", "https://api.hyperbolic.xyz/v1/marketplace")
+# ----------------------------
+# Config
+# ----------------------------
 
-# ---- Scaling policy ----
-POLL_SECONDS = float(os.getenv("POLL_SECONDS", "3"))
-AUTOSCALE_SECONDS = float(os.getenv("AUTOSCALE_SECONDS", "6"))
-BACKLOG_PER_VM = int(os.getenv("BACKLOG_PER_VM", "250"))
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+HYPERBOLIC_API_KEY = os.environ.get("HYPERBOLIC_API_KEY", "")
+ASSIGNED_WORKER_ID = os.environ.get("ASSIGNED_WORKER_ID", "hyperbolic-pool")
 
-# ---- Executor bootstrap ----
+# Scaling policy
+MAX_UNCLAIMED_PER_VM = int(os.getenv("MAX_UNCLAIMED_PER_VM", "250"))
+GPU_CHOICES = [1, 2, 4]  # prefer fewer GPUs (1 > 2 > 4)
+LOOP_SECONDS = float(os.getenv("AUTOSCALER_LOOP_SECONDS", "4"))
+
+# Hyperbolic CLI deterministic home (critical on Fly)
+HCLI_HOME = os.getenv("HYPERBOLIC_CLI_HOME", "/tmp/hyperbolic-cli-home")
+
+# SSH/bootstrap
+SSH_PRIVATE_KEY = os.environ.get("SSH_PRIVATE_KEY", "")
+HYPERBOLIC_SSH_USER = os.getenv("HYPERBOLIC_SSH_USER", "root")
+
 BRAIN_URL = os.getenv("BRAIN_URL", "https://hyper-brain.fly.dev")
 EXECUTOR_TOKEN = os.getenv("EXECUTOR_TOKEN", "")
-ASSIGNED_WORKER_ID = os.getenv("ASSIGNED_WORKER_ID", "hyperbolic-pool")
-POLL_SECONDS_VM = int(os.getenv("EXECUTOR_POLL_SECONDS", "3"))
-IDLE_SECONDS_VM = int(os.getenv("EXECUTOR_IDLE_SECONDS", "3600"))
 
-SSH_PRIVATE_KEY = os.getenv("SSH_PRIVATE_KEY", "")
-HYP_SSH_USER_DEFAULT = os.getenv("HYPERBOLIC_SSH_USER", "ubuntu")
+# Executor behavior
+EXECUTOR_POLL_SECONDS = int(os.getenv("EXECUTOR_POLL_SECONDS", "3"))
+EXECUTOR_IDLE_SECONDS = int(os.getenv("EXECUTOR_IDLE_SECONDS", "3600"))
 
-# Where to fetch the executor loop script from (your repo)
-EXECUTOR_SCRIPT_URL = os.getenv(
-    "EXECUTOR_SCRIPT_URL",
+# Where to fetch the executor loop script from
+EXECUTOR_LOOP_URL = os.getenv(
+    "EXECUTOR_LOOP_URL",
     "https://raw.githubusercontent.com/Showstopper902/hyperbolic_project/main/scripts/hyper_executor_loop.sh",
 )
 
-# B2 env values passed to the VM
+# Secrets for B2 env file we place onto the VM
 B2_SYNC = os.getenv("B2_SYNC", "1")
 B2_BUCKET = os.getenv("B2_BUCKET", "")
 B2_S3_ENDPOINT = os.getenv("B2_S3_ENDPOINT", "")
 AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
-AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "")
-
-# User preference hints (best-effort; only applied if the marketplace objects expose these fields)
-PREF_LOCATION = os.getenv("HYP_PREFERRED_LOCATION", "us-central-1")
-FORCE_ETHERNET = os.getenv("HYP_NETWORK_PREFERENCE", "ethernet").lower() == "ethernet"
+AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "us-west-004")
 
 
 @dataclass
-class Offer:
-    cluster_name: str
-    node_name: str
-    location: str
-    gpus_total: int
-    gpus_available: int
-    gpu_hourly_cost: float
+class Instance:
+    instance_id: str
     raw: Dict[str, Any]
 
 
-def _http_json(method: str, url: str, payload: Optional[dict] = None) -> Any:
-    if not HYP_API_KEY:
-        raise RuntimeError("Missing HYPERBOLIC_API_KEY in env")
+# ----------------------------
+# DB helpers
+# ----------------------------
 
-    data = None
-    headers = {
-        "Authorization": f"Bearer {HYP_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read().decode("utf-8", errors="replace")
-            return json.loads(body) if body else None
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Hyperbolic API HTTP {e.code} for {url}. body_head={body[:300]!r}") from None
-    except Exception as e:
-        raise RuntimeError(f"Hyperbolic API request failed for {url}: {e}") from None
+def db_conn():
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL missing")
+    return psycopg.connect(DATABASE_URL)
 
 
-def list_offers() -> List[Offer]:
-    j = _http_json("GET", HYP_MARKET_BASE)
-    offers: List[Offer] = []
-
-    # Docs show clusters each with nodes; we handle flexible shapes.
-    clusters = j if isinstance(j, list) else j.get("clusters") or j.get("data") or []
-    for c in clusters:
-        cluster_name = c.get("cluster_name") or c.get("clusterName") or c.get("name") or ""
-        nodes = c.get("nodes") or c.get("data") or []
-        for n in nodes:
-            node_name = n.get("node_name") or n.get("nodeName") or n.get("name") or ""
-            location = n.get("location") or n.get("region") or ""
-            gpus_total = int(n.get("gpus_total") or n.get("gpusTotal") or n.get("gpus") or 0)
-            gpus_available = int(n.get("gpus_available") or n.get("gpusAvailable") or n.get("available_gpus") or gpus_total)
-            cost = n.get("gpu_hourly_cost") or n.get("gpuHourlyCost") or n.get("hourly") or 0
-            try:
-                gpu_hourly_cost = float(cost)
-            except Exception:
-                gpu_hourly_cost = 0.0
-
-            if cluster_name and node_name and gpus_total > 0:
-                offers.append(
-                    Offer(
-                        cluster_name=cluster_name,
-                        node_name=node_name,
-                        location=location,
-                        gpus_total=gpus_total,
-                        gpus_available=gpus_available,
-                        gpu_hourly_cost=gpu_hourly_cost,
-                        raw=n,
-                    )
-                )
-    return offers
-
-
-def pick_offer(required_gpus: int) -> Optional[Offer]:
-    offers = [o for o in list_offers() if o.gpus_available >= required_gpus]
-
-    # Best-effort filters if fields exist
-    def is_vm(o: Offer) -> bool:
-        t = (o.raw.get("instance_type") or o.raw.get("instanceType") or "").lower()
-        return ("virtual" in t) if t else True  # if unknown, don't block
-
-    def is_ethernet(o: Offer) -> bool:
-        net = (o.raw.get("network_type") or o.raw.get("networkType") or "").lower()
-        if not net:
-            return True  # unknown
-        return ("ethernet" in net)
-
-    offers = [o for o in offers if is_vm(o)]
-    if FORCE_ETHERNET:
-        offers = [o for o in offers if is_ethernet(o)]
-
-    if not offers:
-        return None
-
-    def score(o: Offer) -> Tuple[int, float, int]:
-        # lower is better
-        loc_penalty = 0 if (PREF_LOCATION and PREF_LOCATION in (o.location or "")) else 1
-        cost = o.gpu_hourly_cost if o.gpu_hourly_cost > 0 else 1e9
-        # prefer nodes with closer-fit capacity
-        cap_penalty = max(0, o.gpus_total - required_gpus)
-        return (loc_penalty, cost, cap_penalty)
-
-    offers.sort(key=score)
-    return offers[0]
-
-
-def ensure_tables() -> None:
-    with get_conn() as conn:
+def get_counts() -> Tuple[int, int]:
+    """
+    Returns:
+      (running_total, unclaimed_running)
+    We scale UP based on unclaimed_running, but we keep at least 1 VM if running_total>0
+    to avoid terminating mid-job.
+    """
+    with db_conn() as conn:
         with conn.cursor() as cur:
+            # tolerate different schemas by being defensive
             cur.execute(
                 """
-                CREATE TABLE IF NOT EXISTS autoscaler_instances (
-                    instance_id TEXT PRIMARY KEY,
-                    gpu_count   INT  NOT NULL,
-                    cluster_name TEXT,
-                    node_name    TEXT,
-                    created_at  TIMESTAMPTZ DEFAULT NOW(),
-                    bootstrapped_at TIMESTAMPTZ,
-                    terminated_at TIMESTAMPTZ
-                );
-                """
-            )
-
-
-def backlog_count() -> int:
-    # backlog definition per your spec:
-    # RUNNING jobs where executor_id IS NULL
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT COUNT(*)
+                SELECT
+                  COALESCE(SUM(CASE WHEN status='RUNNING' THEN 1 ELSE 0 END),0) AS running_total,
+                  COALESCE(SUM(CASE WHEN status='RUNNING' AND executor_id IS NULL THEN 1 ELSE 0 END),0) AS unclaimed_running
                 FROM jobs
-                WHERE status = 'RUNNING'
-                  AND executor_id IS NULL
                 """
             )
             row = cur.fetchone()
-            return int(row[0]) if row else 0
+            running_total = int(row[0] or 0)
+            unclaimed = int(row[1] or 0)
+            return running_total, unclaimed
 
 
-def desired_vm_count(backlog: int) -> int:
-    if backlog <= 0:
+def want_vms(running_total: int, unclaimed: int) -> int:
+    if running_total <= 0:
         return 0
-    return int(math.ceil(backlog / float(BACKLOG_PER_VM)))
+    # at least 1 if anything is RUNNING
+    base = 1
+    # scale beyond 1 only if unclaimed backlog is large
+    extra = (unclaimed + MAX_UNCLAIMED_PER_VM - 1) // MAX_UNCLAIMED_PER_VM
+    return max(base, extra)
 
 
-def tracked_instances() -> List[str]:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT instance_id
-                FROM autoscaler_instances
-                WHERE terminated_at IS NULL
-                ORDER BY created_at ASC
-                """
-            )
-            return [r[0] for r in cur.fetchall()]
+# ----------------------------
+# Hyperbolic CLI wrapper
+# ----------------------------
+
+def _hcli_env() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["HOME"] = HCLI_HOME
+    env["XDG_CONFIG_HOME"] = HCLI_HOME
+    env["XDG_CACHE_HOME"] = HCLI_HOME
+    return env
 
 
-def record_instance(instance_id: str, gpu_count: int, cluster_name: str, node_name: str) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO autoscaler_instances (instance_id, gpu_count, cluster_name, node_name)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (instance_id) DO NOTHING
-                """,
-                (instance_id, gpu_count, cluster_name, node_name),
-            )
+def _run(cmd: List[str], timeout: int = 30, check: bool = True) -> subprocess.CompletedProcess:
+    env = _hcli_env()
+    os.makedirs(HCLI_HOME, exist_ok=True)
+    p = subprocess.run(
+        cmd,
+        text=True,
+        capture_output=True,
+        env=env,
+        timeout=timeout,
+    )
+    if check and p.returncode != 0:
+        raise RuntimeError(
+            f"command failed rc={p.returncode} cmd={cmd} "
+            f"stdout_head={p.stdout[:400]!r} stderr_head={p.stderr[:400]!r}"
+        )
+    return p
 
 
-def mark_bootstrapped(instance_id: str) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE autoscaler_instances
-                SET bootstrapped_at = NOW()
-                WHERE instance_id = %s
-                """,
-                (instance_id,),
-            )
+def ensure_hcli_auth() -> None:
+    if not HYPERBOLIC_API_KEY:
+        raise RuntimeError("HYPERBOLIC_API_KEY missing in env")
+    # Always set-key before doing anything else (Fly machines/users differ)
+    _run(["hyperbolic", "auth", "set-key", HYPERBOLIC_API_KEY], timeout=20, check=True)
 
 
-def mark_terminated(instance_id: str) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE autoscaler_instances
-                SET terminated_at = NOW()
-                WHERE instance_id = %s
-                """,
-                (instance_id,),
-            )
+def parse_json_or_raise(output: str, context: str) -> Any:
+    s = output.strip()
+    if not s.startswith("{") and not s.startswith("["):
+        raise RuntimeError(f"{context} returned non-JSON output: {s[:500]!r}")
+    try:
+        return json.loads(s)
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse JSON from {context}: {e}. head={s[:500]!r}") from e
 
 
-def list_user_instances() -> List[Dict[str, Any]]:
-    j = _http_json("GET", f"{HYP_MARKET_BASE}/instances")
-    if isinstance(j, list):
-        return j
-    return j.get("instances") or j.get("data") or []
+def list_instances() -> List[Instance]:
+    ensure_hcli_auth()
+    p = _run(["hyperbolic", "instances", "--json"], timeout=30, check=True)
+    j = parse_json_or_raise(p.stdout, "hyperbolic instances --json")
+
+    # normalize to list
+    if isinstance(j, dict) and "instances" in j and isinstance(j["instances"], list):
+        items = j["instances"]
+    elif isinstance(j, list):
+        items = j
+    else:
+        # last resort: if it's a dict that looks like one instance
+        items = [j] if isinstance(j, dict) else []
+
+    out: List[Instance] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        iid = str(it.get("instance_id") or it.get("id") or it.get("instanceId") or "")
+        if iid:
+            out.append(Instance(instance_id=iid, raw=it))
+    return out
 
 
-def find_instance(instance_id: str) -> Optional[Dict[str, Any]]:
-    for inst in list_user_instances():
-        iid = inst.get("instance_id") or inst.get("id") or inst.get("instanceId")
-        if iid == instance_id:
-            return inst
-    return None
-
-
-def create_instance(required_gpus: int) -> str:
-    offer = pick_offer(required_gpus)
-    if not offer:
-        raise RuntimeError(f"No marketplace offer available with >= {required_gpus} GPUs")
-
-    payload = {
-        "cluster_name": offer.cluster_name,
-        "node_name": offer.node_name,
-        "gpu_count": required_gpus,
-        # We are NOT using the optional `image` mode here.
-        # We want a normal VM we can SSH into and bootstrap.
-    }
-    resp = _http_json("POST", f"{HYP_MARKET_BASE}/instances/create", payload)
-    # Accept flexible response shapes
-    instance_id = None
-    if isinstance(resp, dict):
-        instance_id = resp.get("instance_id") or resp.get("id") or resp.get("instanceId")
-        if not instance_id and isinstance(resp.get("data"), dict):
-            d = resp["data"]
-            instance_id = d.get("instance_id") or d.get("id") or d.get("instanceId")
-
-    if not instance_id:
-        raise RuntimeError(f"Create instance did not return instance_id. resp_head={str(resp)[:300]!r}")
-
-    record_instance(instance_id, required_gpus, offer.cluster_name, offer.node_name)
-    return instance_id
+def instance_detail(instance_id: str) -> Dict[str, Any]:
+    ensure_hcli_auth()
+    p = _run(["hyperbolic", "instances", instance_id, "--json"], timeout=30, check=True)
+    return parse_json_or_raise(p.stdout, f"hyperbolic instances {instance_id} --json")
 
 
 def terminate_instance(instance_id: str) -> None:
-    _http_json("POST", f"{HYP_MARKET_BASE}/instances/terminate", {"instance_id": instance_id})
-    mark_terminated(instance_id)
+    ensure_hcli_auth()
+    _run(["hyperbolic", "terminate", instance_id], timeout=30, check=True)
 
 
-def _write_ssh_key() -> str:
+def _gpu_count_of(raw: Dict[str, Any]) -> Optional[int]:
+    for k in ("gpu_count", "gpuCount", "gpus", "gpu"):
+        v = raw.get(k)
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str) and v.isdigit():
+            return int(v)
+    # sometimes nested
+    spec = raw.get("spec") or raw.get("configuration") or {}
+    if isinstance(spec, dict):
+        for k in ("gpu_count", "gpuCount", "gpus"):
+            v = spec.get(k)
+            if isinstance(v, int):
+                return v
+            if isinstance(v, str) and v.isdigit():
+                return int(v)
+    return None
+
+
+def rent_vm(gpu_count: int) -> str:
+    """
+    Never parse rent stdout (unstable). Instead:
+      - snapshot instances
+      - run rent
+      - poll instances and find the new one
+    """
+    ensure_hcli_auth()
+
+    before = {i.instance_id for i in list_instances()}
+
+    p = _run(
+        ["hyperbolic", "rent", "ondemand", "--instance-type", "virtual-machine", "--gpu-count", str(gpu_count)],
+        timeout=60,
+        check=False,  # we want the real error payload if it fails
+    )
+    if p.returncode != 0:
+        # This is where your 404 is coming from; surface it clearly.
+        raise RuntimeError(
+            f"rent failed gpu_count={gpu_count} rc={p.returncode} "
+            f"stdout_head={p.stdout[:600]!r} stderr_head={p.stderr[:600]!r}"
+        )
+
+    # Poll for a new instance showing up
+    for _ in range(30):  # ~60s
+        time.sleep(2)
+        after_list = list_instances()
+        after = {i.instance_id for i in after_list}
+        new_ids = list(after - before)
+        if not new_ids:
+            continue
+
+        # Prefer one matching gpu_count
+        for iid in new_ids:
+            inst = next((x for x in after_list if x.instance_id == iid), None)
+            if inst and _gpu_count_of(inst.raw) == gpu_count:
+                return iid
+
+        # Otherwise return newest-looking id
+        return new_ids[0]
+
+    raise RuntimeError("rent succeeded but could not discover new instance_id via instances --json")
+
+
+# ----------------------------
+# SSH/bootstrap
+# ----------------------------
+
+def _write_temp_key() -> str:
     if not SSH_PRIVATE_KEY.strip():
-        raise RuntimeError("Missing SSH_PRIVATE_KEY in Fly secrets")
-
-    path = "/tmp/hyperbolic_ssh_key"
-    # Normalize line endings
-    key = SSH_PRIVATE_KEY.replace("\r\n", "\n").strip() + "\n"
+        raise RuntimeError("SSH_PRIVATE_KEY missing/empty")
+    fd, path = tempfile.mkstemp(prefix="hyperbolic_ssh_", text=True)
+    os.close(fd)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(key)
+        f.write(SSH_PRIVATE_KEY.strip() + "\n")
     os.chmod(path, 0o600)
     return path
 
 
-def _extract_ssh_target(inst: Dict[str, Any]) -> Tuple[str, str, Optional[int]]:
+def _extract_ssh_target(detail: Dict[str, Any]) -> Tuple[str, int, str]:
     """
-    Returns (user, host, port)
-    Tries to parse common shapes like:
-      - ssh_command: "ssh ubuntu@1.2.3.4"
-      - ip_address + ssh_port
+    Returns (host, port, user). We try multiple shapes.
     """
-    ssh_cmd = inst.get("ssh_command") or inst.get("sshCommand") or ""
-    if ssh_cmd:
-        # try parse "ssh user@host" and optional "-p 22"
-        port = None
-        m_port = re.search(r"\s-p\s+(\d+)", ssh_cmd)
-        if m_port:
-            port = int(m_port.group(1))
-        m = re.search(r"ssh\s+(?:[^@]*\s+)?([A-Za-z0-9._-]+)@([A-Za-z0-9.\-]+)", ssh_cmd)
-        if m:
-            return m.group(1), m.group(2), port
+    # Common: ssh_command like "ssh user@host" or includes -p
+    ssh_cmd = detail.get("ssh_command") or detail.get("sshCommand") or detail.get("ssh")
+    if isinstance(ssh_cmd, str) and "ssh" in ssh_cmd:
+        parts = shlex.split(ssh_cmd)
+        # find -p and user@host
+        port = 22
+        target = None
+        i = 0
+        while i < len(parts):
+            if parts[i] == "-p" and i + 1 < len(parts):
+                try:
+                    port = int(parts[i + 1])
+                except Exception:
+                    pass
+                i += 2
+                continue
+            if parts[i].endswith("@") or parts[i].startswith("-"):
+                i += 1
+                continue
+            if "@" in parts[i] and not parts[i].startswith("-") and parts[i] != "ssh":
+                target = parts[i]
+            i += 1
 
-    host = inst.get("ip_address") or inst.get("ipAddress") or inst.get("host") or inst.get("public_ip") or ""
-    port = inst.get("ssh_port") or inst.get("sshPort")
-    port = int(port) if port else None
-    user = inst.get("ssh_user") or inst.get("sshUser") or HYP_SSH_USER_DEFAULT
-    if host:
-        return user, host, port
-    raise RuntimeError(f"Could not determine SSH target for instance. keys={list(inst.keys())}")
+        if target:
+            user, host = target.split("@", 1)
+            return host, port, user
+
+    # Alternate: structured fields
+    host = detail.get("host") or detail.get("ip") or detail.get("ip_address") or detail.get("public_ip")
+    port = detail.get("port") or detail.get("ssh_port") or 22
+    user = detail.get("user") or detail.get("ssh_user") or HYPERBOLIC_SSH_USER
+
+    if isinstance(host, str) and host:
+        try:
+            port = int(port)
+        except Exception:
+            port = 22
+        return host, port, str(user)
+
+    raise RuntimeError(f"Could not extract ssh target from instance detail keys={list(detail.keys())[:30]}")
 
 
-def _ssh_run(user: str, host: str, key_path: str, cmd: str, port: Optional[int] = None) -> None:
-    base = [
-        "ssh",
-        "-i",
-        key_path,
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=15",
-    ]
-    if port:
-        base += ["-p", str(port)]
-    base += [f"{user}@{host}", "bash", "-lc", cmd]
-    subprocess.run(base, check=True)
+def ssh_run(host: str, port: int, user: str, script: str) -> None:
+    key_path = _write_temp_key()
+    try:
+        cmd = [
+            "ssh",
+            "-i", key_path,
+            "-p", str(port),
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10",
+            f"{user}@{host}",
+            "bash -lc 'cat > /tmp/bootstrap.sh && sudo bash /tmp/bootstrap.sh'",
+        ]
+        p = subprocess.run(
+            cmd,
+            input=script,
+            text=True,
+            capture_output=True,
+            timeout=180,
+        )
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"ssh bootstrap failed rc={p.returncode} host={host} "
+                f"stdout_head={p.stdout[:600]!r} stderr_head={p.stderr[:600]!r}"
+            )
+    finally:
+        try:
+            os.remove(key_path)
+        except Exception:
+            pass
 
 
-def bootstrap_executor(instance_id: str) -> None:
+def build_bootstrap_script() -> str:
     """
-    Waits for SSH info then bootstraps the VM.
+    Generates the exact VM-side bootstrap steps (your "way 2"):
+      - write env files
+      - install executor loop script
+      - install+enable systemd service
     """
-    key_path = _write_ssh_key()
+    # DO NOT log this script (contains secrets)
+    if not EXECUTOR_TOKEN:
+        raise RuntimeError("EXECUTOR_TOKEN missing (needed to run executor loop on VM)")
+    if not B2_BUCKET or not B2_S3_ENDPOINT or not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
+        raise RuntimeError("B2/AWS env vars missing (bucket/endpoint/access key/secret)")
 
-    # Poll instance until SSH info shows up
-    inst = None
-    for _ in range(90):  # ~90 * 2s = 3 min
-        inst = find_instance(instance_id)
-        if inst:
-            try:
-                _extract_ssh_target(inst)
-                break
-            except Exception:
-                pass
-        time.sleep(2)
-
-    if not inst:
-        raise RuntimeError("Instance never appeared in /instances list")
-
-    user, host, port = _extract_ssh_target(inst)
-
-    # Build the remote bootstrap script as a single bash -lc string
-    # NOTE: We keep quoting conservative by using EOF blocks on the remote.
-    remote = f"""
+    return f"""#!/usr/bin/env bash
 set -euo pipefail
 
 sudo mkdir -p /data/secrets /data/bin
 
-# --- B2 env ---
-sudo bash -c 'cat > /data/secrets/b2.env <<\\EOF
-B2_SYNC={shlex.quote(B2_SYNC)}
-B2_BUCKET={shlex.quote(B2_BUCKET)}
-B2_S3_ENDPOINT={shlex.quote(B2_S3_ENDPOINT)}
-AWS_ACCESS_KEY_ID={shlex.quote(AWS_ACCESS_KEY_ID)}
-AWS_SECRET_ACCESS_KEY={shlex.quote(AWS_SECRET_ACCESS_KEY)}
-AWS_DEFAULT_REGION={shlex.quote(AWS_DEFAULT_REGION)}
+# ---- B2 env ----
+sudo bash -c 'cat > /data/secrets/b2.env <<EOF
+B2_SYNC={B2_SYNC}
+B2_BUCKET={B2_BUCKET}
+B2_S3_ENDPOINT={B2_S3_ENDPOINT}
+AWS_ACCESS_KEY_ID={AWS_ACCESS_KEY_ID}
+AWS_SECRET_ACCESS_KEY={AWS_SECRET_ACCESS_KEY}
+AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}
 EOF'
 sudo chmod 600 /data/secrets/b2.env
 
-# --- executor env ---
-sudo bash -c 'cat > /data/secrets/hyper_executor.env <<\\EOF
-EXECUTOR_TOKEN={shlex.quote(EXECUTOR_TOKEN)}
-BRAIN_URL={shlex.quote(BRAIN_URL)}
-ASSIGNED_WORKER_ID={shlex.quote(ASSIGNED_WORKER_ID)}
-POLL_SECONDS={POLL_SECONDS_VM}
-IDLE_SECONDS={IDLE_SECONDS_VM}
+# ---- executor env ----
+sudo bash -c 'cat > /data/secrets/hyper_executor.env <<EOF
+EXECUTOR_TOKEN="{EXECUTOR_TOKEN}"
+BRAIN_URL="{BRAIN_URL}"
+ASSIGNED_WORKER_ID="{ASSIGNED_WORKER_ID}"
+POLL_SECONDS={EXECUTOR_POLL_SECONDS}
+IDLE_SECONDS={EXECUTOR_IDLE_SECONDS}
 EXECUTOR_ID="exec-$(hostname)"
 EOF'
 sudo chmod 600 /data/secrets/hyper_executor.env
 
-# --- executor loop ---
-sudo curl -fsSL {shlex.quote(EXECUTOR_SCRIPT_URL)} -o /data/bin/hyper_executor_loop.sh
+# ---- executor loop script ----
+sudo curl -fsSL "{EXECUTOR_LOOP_URL}" -o /data/bin/hyper_executor_loop.sh
 sudo chmod +x /data/bin/hyper_executor_loop.sh
 
-# --- systemd unit ---
+# ---- systemd unit ----
 sudo tee /etc/systemd/system/hyper-executor.service >/dev/null <<'EOF'
 [Unit]
 Description=Hyperbolic GPU Executor Loop
@@ -437,81 +412,77 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable --now hyper-executor.service
+sudo systemctl restart hyper-executor.service || true
 """
 
-    _ssh_run(user, host, key_path, remote, port=port)
-    mark_bootstrapped(instance_id)
 
+# ----------------------------
+# Main loop
+# ----------------------------
 
-def autoscale_once() -> None:
-    ensure_tables()
+def autoscaler_tick() -> None:
+    running_total, unclaimed = get_counts()
+    want = want_vms(running_total, unclaimed)
 
-    b = backlog_count()
-    want = desired_vm_count(b)
-    tracked = tracked_instances()
+    inst = list_instances()
+    have = len(inst)
 
-    # Clean up tracked ids that no longer exist
-    alive_ids = set()
-    for iid in tracked:
-        inst = find_instance(iid)
-        if inst:
-            alive_ids.add(iid)
-        else:
-            # if it vanished, mark terminated so we don't keep counting it
-            mark_terminated(iid)
+    LOG.info("running_total=%s unclaimed=%s want_vms=%s have_vms=%s", running_total, unclaimed, want, have)
 
-    have = len(alive_ids)
-    LOG.info("backlog=%s want_vms=%s have_vms=%s", b, want, have)
-
-    # Scale up
-    while have < want:
-        # 1 job per VM for now, and you prefer as few GPUs as possible
-        for gpu_count in (1, 2, 4):
+    # Scale down only when truly no RUNNING jobs exist.
+    if want == 0:
+        if have > 0:
+            LOG.info("no backlog -> terminating %s instance(s)", have)
+        for i in inst:
             try:
-                LOG.info("renting %sx GPU VM on Hyperbolic Marketplace...", gpu_count)
-                iid = create_instance(gpu_count)
-                LOG.info("rented instance_id=%s (gpu_count=%s) - bootstrapping...", iid, gpu_count)
-                bootstrap_executor(iid)
-                have += 1
-                break
+                terminate_instance(i.instance_id)
+                LOG.info("terminated instance_id=%s", i.instance_id)
             except Exception as e:
-                LOG.info("rent attempt failed for gpu_count=%s: %s", gpu_count, e)
-        else:
-            raise RuntimeError("could not rent any VM size (1/2/4)")
+                LOG.info("terminate failed instance_id=%s err=%s", i.instance_id, e)
+        return
 
-    # Scale down (only if you explicitly want 0)
-    if want == 0 and have > 0:
-        # terminate everything we created (saves money vs waiting for VM idle shutdown)
-        for iid in list(alive_ids):
-            try:
-                LOG.info("terminating instance_id=%s (no backlog)", iid)
-                terminate_instance(iid)
-            except Exception as e:
-                LOG.info("terminate failed for %s: %s", iid, e)
+    # If we already have at least one VM, do nothing (your “1 VM handles many jobs” rule)
+    # Only scale up beyond 1 when unclaimed backlog exceeds thresholds.
+    if have >= want:
+        return
+
+    # Need +1 VM
+    for gpu in GPU_CHOICES:
+        try:
+            LOG.info("renting %sx GPU VM on Hyperbolic...", gpu)
+            iid = rent_vm(gpu)
+            LOG.info("rented instance_id=%s; bootstrapping...", iid)
+
+            detail = instance_detail(iid)
+            host, port, user = _extract_ssh_target(detail)
+
+            script = build_bootstrap_script()
+            # Wait for SSH to come up
+            for attempt in range(30):
+                try:
+                    ssh_run(host, port, user, script)
+                    LOG.info("bootstrap ok instance_id=%s host=%s", iid, host)
+                    return
+                except Exception as e:
+                    if attempt == 29:
+                        raise
+                    time.sleep(4)
+
+        except Exception as e:
+            LOG.info("rent/bootstrap attempt failed for gpu_count=%s: %s", gpu, e)
+
+    raise RuntimeError("could not rent+bootstrap any VM size (1/2/4 failed)")
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=os.getenv("LOG_LEVEL", "INFO"),
-        format="%(asctime)s [%(levelname)s][brain-worker] %(message)s",
-        stream=sys.stdout,
-    )
-
-    if not EXECUTOR_TOKEN:
-        LOG.info("WARNING: EXECUTOR_TOKEN missing; autoscaler can rent VMs but executor bootstrap will not work.")
-    if not SSH_PRIVATE_KEY.strip():
-        LOG.info("WARNING: SSH_PRIVATE_KEY missing; autoscaler can rent VMs but cannot bootstrap them.")
-
-    last = 0.0
+    LOG.info("autoscaler starting (HCLI_HOME=%s)", HCLI_HOME)
     while True:
-        now = time.time()
-        if now - last >= AUTOSCALE_SECONDS:
-            last = now
-            try:
-                autoscale_once()
-            except Exception as e:
-                LOG.info("autoscaler error: %s", e)
-        time.sleep(POLL_SECONDS)
+        try:
+            autoscaler_tick()
+        except Exception:
+            # full traceback (this is how we stop getting useless "error: 0")
+            LOG.exception("autoscaler error")
+        time.sleep(LOOP_SECONDS)
 
 
 if __name__ == "__main__":
