@@ -1,19 +1,39 @@
+#!/usr/bin/env python3
+"""
+Hyper-brain autoscaler worker.
+
+Goals:
+- Scale Hyperbolic GPU VMs up/down based on backlog (unclaimed RUNNING/QUEUED jobs).
+- "No backlog = no instances."
+- Preference: VM, 1 GPU if possible (fallback 2 then 4), 1 executor per VM.
+- Bootstrap VMs over SSH (Way 2) by installing hyper_executor_loop.sh + systemd unit.
+
+This file is intentionally stdlib-heavy to avoid dependency fragility.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
 import os
 import re
-import json
-import time
-import base64
-import logging
+import shlex
+import signal
 import subprocess
+import sys
+import tempfile
+import textwrap
+import time
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, Any, List
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
-import psycopg
 
-
-# ---------------------------
+# ----------------------------
 # Logging
-# ---------------------------
+# ----------------------------
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -22,48 +42,42 @@ logging.basicConfig(
 log = logging.getLogger("brain-worker")
 
 
-# ---------------------------
+# ----------------------------
 # Config
-# ---------------------------
-DATABASE_URL = os.getenv("DATABASE_URL", "")
+# ----------------------------
 
-POLL_SECONDS = int(os.getenv("POLL_SECONDS", "3"))
+BRAIN_URL = os.getenv("BRAIN_URL", "https://hyper-brain.fly.dev").rstrip("/")
+ASSIGNED_WORKER_ID = os.getenv("ASSIGNED_WORKER_ID", "hyperbolic-pool")
 
-# Scaling rule: 0 backlog => 0 VMs; else 1 VM per 250 unclaimed RUNNING jobs
-BACKLOG_PER_VM = int(os.getenv("BACKLOG_PER_VM", "250"))
+# Backlog policy: 0 backlog => 0 VMs.
+BACKLOG_PER_VM = int(os.getenv("BACKLOG_PER_VM", "250"))  # your rule: +1 VM per 250 unclaimed
+TICK_SECONDS = float(os.getenv("AUTOSCALER_TICK_SECONDS", "4"))
 
-# Hyperbolic preferences (you said: VM, 1>2>4 GPUs, prefer us-central-1, ethernet, payg)
-GPU_CHOICES = [1, 2, 4]
+# GPU sizing preference
+GPU_FALLBACKS = [int(x) for x in os.getenv("GPU_FALLBACKS", "1,2,4").split(",") if x.strip()]
+MAX_GPUS = int(os.getenv("MAX_GPUS", "4"))
 
-# Where to fetch the executor loop script on the Hyperbolic VM
+# Hyperbolic CLI
+HYPERBOLIC_BIN = os.getenv("HYPERBOLIC_BIN", "hyperbolic")
+HYPERBOLIC_API_KEY = os.getenv("HYPERBOLIC_API_KEY", "").strip()
+
+# If the CLI supports an override env var for base URL, you can set it in Fly secrets:
+# flyctl secrets set -a hyper-brain HYPERBOLIC_API_BASE_URL=https://api.hyperbolic.ai
+HYPERBOLIC_API_BASE_URL = os.getenv("HYPERBOLIC_API_BASE_URL", "").strip()
+
+# SSH / bootstrap
+SSH_PRIVATE_KEY = os.getenv("SSH_PRIVATE_KEY", "")
+HYPERBOLIC_SSH_USER = os.getenv("HYPERBOLIC_SSH_USER", "root")
+# The script the VM should download (your hyperbolic_project repo)
 EXECUTOR_LOOP_URL = os.getenv(
     "EXECUTOR_LOOP_URL",
     "https://raw.githubusercontent.com/Showstopper902/hyperbolic_project/main/scripts/hyper_executor_loop.sh",
 )
 
-# Brain URL (used by executor env on the rented VM)
-BRAIN_URL = os.getenv("BRAIN_URL", "https://hyper-brain.fly.dev")
-ASSIGNED_WORKER_ID = os.getenv("ASSIGNED_WORKER_ID", "hyperbolic-pool")
-EXECUTOR_TOKEN = os.getenv("EXECUTOR_TOKEN", "")
+# VM local secrets to write
+EXECUTOR_TOKEN = os.getenv("EXECUTOR_TOKEN", "").strip()
 
-# SSH
-HYPERBOLIC_SSH_USER = os.getenv("HYPERBOLIC_SSH_USER", "ubuntu")  # you set this as a secret
-SSH_PRIVATE_KEY = os.getenv("SSH_PRIVATE_KEY", "")
-
-# Hyperbolic API Key for CLI
-HYPERBOLIC_API_KEY = (
-    os.getenv("HYPERBOLIC_API_KEY")
-    or os.getenv("HYPERBOLIC_KEY")
-    or os.getenv("HYPERBOLIC_TOKEN")
-    or ""
-)
-
-# IMPORTANT: try to force the API base if Hyperbolic moved domains (common cause of your 404s)
-# We set multiple possible env vars so whichever the CLI respects will stick.
-HYPERBOLIC_API_BASE = os.getenv("HYPERBOLIC_API_BASE", "https://api.hyperbolic.xyz")
-HYPERBOLIC_APP_BASE = os.getenv("HYPERBOLIC_APP_BASE", "https://app.hyperbolic.xyz")
-
-# B2 env (passed down to executor VM)
+# B2 env (passed to VM)
 B2_SYNC = os.getenv("B2_SYNC", "1")
 B2_BUCKET = os.getenv("B2_BUCKET", "")
 B2_S3_ENDPOINT = os.getenv("B2_S3_ENDPOINT", "")
@@ -71,282 +85,384 @@ AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
 AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
 AWS_DEFAULT_REGION = os.getenv("AWS_DEFAULT_REGION", "")
 
-
-# ---------------------------
-# DB helpers
-# ---------------------------
-def db_conn():
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing")
-    return psycopg.connect(DATABASE_URL)
+# Safety: only terminate instances that contain this marker in their name/metadata (if present).
+# If your CLI JSON includes tags/names, you can enforce this. Default: allow all.
+INSTANCE_NAME_PREFIX = os.getenv("INSTANCE_NAME_PREFIX", "").strip()
 
 
-def ensure_tables():
-    # Keep it minimal: jobs table is assumed to exist already.
-    # We add a small table to track rented Hyperbolic VMs (instance_id + ssh info)
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS hyper_vms (
-              instance_id TEXT PRIMARY KEY,
-              gpu_count INT NOT NULL,
-              ssh_user TEXT,
-              ssh_host TEXT,
-              ssh_port INT,
-              raw_ssh_cmd TEXT,
-              created_at TIMESTAMPTZ DEFAULT now(),
-              terminated_at TIMESTAMPTZ
-            );
-            """
-        )
-        conn.commit()
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def _redact(s: str, keep: int = 200) -> str:
+    s = s or ""
+    s = s.replace(HYPERBOLIC_API_KEY, "REDACTED_API_KEY") if HYPERBOLIC_API_KEY else s
+    s = s.replace(EXECUTOR_TOKEN, "REDACTED_EXECUTOR_TOKEN") if EXECUTOR_TOKEN else s
+    return s[:keep]
+
+
+def _which(cmd: str) -> str:
+    from shutil import which
+    p = which(cmd)
+    return p or cmd
+
+
+def _json_extract_first(payload: str) -> Optional[str]:
+    """
+    Extract the first JSON object/array from a string, if any.
+    Handles cases where CLI prints extra lines before JSON.
+    """
+    if not payload:
+        return None
+    start = None
+    for i, ch in enumerate(payload):
+        if ch in "{[":
+            start = i
+            break
+    if start is None:
+        return None
+
+    stack = []
+    in_str = False
+    esc = False
+    for i in range(start, len(payload)):
+        ch = payload[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        else:
+            if ch == '"':
+                in_str = True
+                continue
+            if ch in "{[":
+                stack.append(ch)
+            elif ch in "}]":
+                if not stack:
+                    return None
+                op = stack.pop()
+                if (op == "{" and ch != "}") or (op == "[" and ch != "]"):
+                    return None
+                if not stack:
+                    return payload[start : i + 1]
+    return None
+
+
+def _parse_json_or_raise(stdout: str, context: str) -> Any:
+    raw = (stdout or "").strip()
+    js = _json_extract_first(raw)
+    if not js:
+        raise RuntimeError(f"{context} returned non-JSON output. stdout_head={raw[:500]!r}")
+    try:
+        return json.loads(js)
+    except Exception as e:
+        raise RuntimeError(f"{context} returned JSON but parsing failed: {e}. json_head={js[:500]!r}")
+
+
+# ----------------------------
+# DB backlog (stdlib-first)
+# ----------------------------
+
+def _db_connect():
+    """
+    Supports:
+    - sqlite:///path
+    - postgres:// / postgresql:// via psycopg2 or psycopg (if installed)
+    """
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if not db_url:
+        raise RuntimeError("DATABASE_URL missing")
+
+    if db_url.startswith("sqlite:"):
+        import sqlite3
+        # sqlite:////data/db.sqlite -> /data/db.sqlite
+        path = db_url.split("sqlite:", 1)[1]
+        path = path.lstrip("/")
+        path = "/" + path
+        conn = sqlite3.connect(path)
+        return ("sqlite", conn)
+
+    # Postgres
+    scheme = urlparse(db_url).scheme.lower()
+    if scheme in ("postgres", "postgresql"):
+        try:
+            import psycopg2  # type: ignore
+            conn = psycopg2.connect(db_url)
+            return ("psycopg2", conn)
+        except Exception:
+            pass
+        try:
+            import psycopg  # type: ignore
+            conn = psycopg.connect(db_url)
+            return ("psycopg", conn)
+        except Exception as e:
+            raise RuntimeError(f"Postgres driver missing (install psycopg2-binary or psycopg): {e}")
+
+    raise RuntimeError(f"Unsupported DATABASE_URL scheme: {db_url}")
+
+
+def _db_scalar(conn_kind: str, conn, sql: str, params: Tuple[Any, ...] = ()) -> int:
+    if conn_kind == "sqlite":
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return int(row[0] if row and row[0] is not None else 0)
+
+    # psycopg2/psycopg
+    cur = conn.cursor()
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    return int(row[0] if row and row[0] is not None else 0)
 
 
 def backlog_counts() -> Tuple[int, int]:
     """
-    Returns:
-      unclaimed = count of RUNNING jobs where executor_id IS NULL
-      inflight  = count of RUNNING jobs where executor_id IS NOT NULL
+    Returns (unclaimed_backlog, inflight_claimed).
+    We only scale on unclaimed_backlog per your rule.
     """
-    with db_conn() as conn, conn.cursor() as cur:
-        # Your requirement: use RUNNING + executor_id IS NULL for backlog.
-        cur.execute(
-            """
-            SELECT
-              COALESCE(SUM(CASE WHEN status='RUNNING' AND executor_id IS NULL THEN 1 ELSE 0 END),0) AS unclaimed,
-              COALESCE(SUM(CASE WHEN status='RUNNING' AND executor_id IS NOT NULL THEN 1 ELSE 0 END),0) AS inflight
-            FROM jobs;
-            """
+    kind, conn = _db_connect()
+    try:
+        # Be permissive: some jobs might be QUEUED, some marked RUNNING immediately.
+        unclaimed = _db_scalar(
+            kind, conn,
+            "SELECT COUNT(*) FROM jobs WHERE executor_id IS NULL AND status IN ('QUEUED','RUNNING')"
         )
-        row = cur.fetchone()
-        if not row:
-            return 0, 0
-        return int(row[0]), int(row[1])
-
-
-def list_tracked_vms() -> List[Dict[str, Any]]:
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            SELECT instance_id, gpu_count, ssh_user, ssh_host, ssh_port, raw_ssh_cmd, terminated_at
-            FROM hyper_vms
-            WHERE terminated_at IS NULL
-            ORDER BY created_at ASC;
-            """
+        inflight = _db_scalar(
+            kind, conn,
+            "SELECT COUNT(*) FROM jobs WHERE executor_id IS NOT NULL AND status IN ('QUEUED','RUNNING')"
         )
-        rows = cur.fetchall() or []
-        out = []
-        for r in rows:
-            out.append(
-                dict(
-                    instance_id=r[0],
-                    gpu_count=int(r[1]),
-                    ssh_user=r[2],
-                    ssh_host=r[3],
-                    ssh_port=int(r[4]) if r[4] is not None else None,
-                    raw_ssh_cmd=r[5],
-                    terminated_at=r[6],
-                )
-            )
-        return out
+        return unclaimed, inflight
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
-def track_vm(instance_id: str, gpu_count: int, ssh_user: str, ssh_host: str, ssh_port: int, raw_ssh_cmd: str):
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO hyper_vms (instance_id, gpu_count, ssh_user, ssh_host, ssh_port, raw_ssh_cmd)
-            VALUES (%s,%s,%s,%s,%s,%s)
-            ON CONFLICT (instance_id) DO UPDATE
-              SET gpu_count=EXCLUDED.gpu_count,
-                  ssh_user=EXCLUDED.ssh_user,
-                  ssh_host=EXCLUDED.ssh_host,
-                  ssh_port=EXCLUDED.ssh_port,
-                  raw_ssh_cmd=EXCLUDED.raw_ssh_cmd,
-                  terminated_at=NULL;
-            """
-            ,
-            (instance_id, gpu_count, ssh_user, ssh_host, ssh_port, raw_ssh_cmd),
-        )
-        conn.commit()
+# ----------------------------
+# Hyperbolic CLI wrapper
+# ----------------------------
+
+@dataclass
+class CmdResult:
+    rc: int
+    stdout: str
+    stderr: str
 
 
-def mark_terminated(instance_id: str):
-    with db_conn() as conn, conn.cursor() as cur:
-        cur.execute("UPDATE hyper_vms SET terminated_at=now() WHERE instance_id=%s;", (instance_id,))
-        conn.commit()
+def _hyperbolic_env() -> Dict[str, str]:
+    """
+    Ensure CLI has a stable config home so it can find auth config.
+    We do NOT rely on whatever $HOME is in Fly; we force it.
+    """
+    env = dict(os.environ)
+
+    # Stable writable config home
+    env["HOME"] = env.get("HOME", "/root")
+    env["XDG_CONFIG_HOME"] = env.get("XDG_CONFIG_HOME", "/tmp/hyperbolic-cli-config")
+    env["XDG_CACHE_HOME"] = env.get("XDG_CACHE_HOME", "/tmp/hyperbolic-cli-cache")
+
+    # Optional base URL override (only helps if CLI supports it)
+    if HYPERBOLIC_API_BASE_URL:
+        env["HYPERBOLIC_API_BASE_URL"] = HYPERBOLIC_API_BASE_URL
+
+    return env
 
 
-# ---------------------------
-# Subprocess helpers
-# ---------------------------
-def run_cmd(cmd: List[str], env: Optional[Dict[str, str]] = None, timeout: int = 60) -> subprocess.CompletedProcess:
-    return subprocess.run(
+def run_hcli(args: List[str], timeout: int = 60) -> CmdResult:
+    cmd = [_which(HYPERBOLIC_BIN)] + args
+    p = subprocess.run(
         cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        env=_hyperbolic_env(),
+        capture_output=True,
         text=True,
-        env=env,
         timeout=timeout,
     )
+    return CmdResult(p.returncode, p.stdout or "", p.stderr or "")
 
 
-def hyperbolic_env() -> Dict[str, str]:
+def ensure_hcli_auth() -> None:
     """
-    Force a clean config HOME so the CLI always finds its auth config,
-    even if Fly runs as different users.
-    Also try forcing API base URLs to avoid the 404 you're seeing.
+    Idempotently write config using the API key.
     """
-    e = dict(os.environ)
-
-    # Force a stable CLI home/config location
-    cli_home = "/tmp/hyperbolic-cli-home"
-    e["HOME"] = cli_home
-    e["XDG_CONFIG_HOME"] = cli_home
-    e["XDG_CACHE_HOME"] = cli_home
-
-    # Domain/base overrides (the CLI will ignore unknown vars, but if it supports any of these, it fixes 404)
-    e["HYPERBOLIC_API_BASE_URL"] = HYPERBOLIC_API_BASE
-    e["HYPERBOLIC_API_URL"] = HYPERBOLIC_API_BASE
-    e["HYPERBOLIC_BASE_URL"] = HYPERBOLIC_API_BASE
-    e["HYPERBOLIC_ENDPOINT"] = HYPERBOLIC_API_BASE
-    e["HYPERBOLIC_APP_URL"] = HYPERBOLIC_APP_BASE
-
-    return e
-
-
-def ensure_hyperbolic_auth():
     if not HYPERBOLIC_API_KEY:
-        raise RuntimeError("HYPERBOLIC_API_KEY is empty in the worker environment (Fly secret not visible).")
+        raise RuntimeError("HYPERBOLIC_API_KEY missing in env")
 
-    e = hyperbolic_env()
-    # Create the HOME dir
-    run_cmd(["bash", "-lc", "mkdir -p /tmp/hyperbolic-cli-home"], env=e, timeout=10)
-
-    p = run_cmd(["hyperbolic", "auth", "set-key", HYPERBOLIC_API_KEY], env=e, timeout=20)
-    if p.returncode != 0:
-        raise RuntimeError(f"hyperbolic auth set-key failed rc={p.returncode} stdout={p.stdout[:400]!r} stderr={p.stderr[:400]!r}")
+    # set-key is safe to run repeatedly
+    r = run_hcli(["auth", "set-key", HYPERBOLIC_API_KEY], timeout=30)
+    if r.rc != 0:
+        raise RuntimeError(f"hyperbolic auth set-key failed rc={r.rc} stdout={_redact(r.stdout)!r} stderr={_redact(r.stderr)!r}")
 
 
-# ---------------------------
-# Parse helpers
-# ---------------------------
-UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+def list_instances() -> List[Dict[str, Any]]:
+    ensure_hcli_auth()
+    r = run_hcli(["instances", "--json"], timeout=60)
+    if r.rc != 0:
+        raise RuntimeError(f"hyperbolic instances --json failed rc={r.rc} stdout={_redact(r.stdout,500)!r} stderr={_redact(r.stderr,500)!r}")
+    j = _parse_json_or_raise(r.stdout, "hyperbolic instances --json")
 
-def parse_instance_id(text: str) -> Optional[str]:
-    # Prefer UUID if present
-    m = UUID_RE.search(text)
-    if m:
-        return m.group(0)
-
-    # Fallback: "instance-id: XXX" / "instance_id=XXX"
-    m = re.search(r"(?:instance[_ -]?id)\s*[:=]\s*([A-Za-z0-9\-]+)", text, re.I)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-def parse_ssh_cmd(text: str) -> Optional[str]:
-    # Find the first "ssh ..." line
-    m = re.search(r"(ssh\b[^\n\r]+)", text)
-    if not m:
-        return None
-    return m.group(1).strip()
+    # The CLI may return either a list or an object containing list.
+    if isinstance(j, list):
+        return j
+    if isinstance(j, dict):
+        # common patterns
+        for k in ("instances", "data", "result"):
+            if k in j and isinstance(j[k], list):
+                return j[k]
+    # fallback: treat as empty
+    return []
 
 
-def parse_ssh_target(ssh_cmd: str) -> Optional[Tuple[str, str, int]]:
+def terminate_instance(instance_id: str) -> None:
+    ensure_hcli_auth()
+    r = run_hcli(["terminate", instance_id], timeout=60)
+    if r.rc != 0:
+        raise RuntimeError(f"terminate failed id={instance_id} rc={r.rc} stdout={_redact(r.stdout,500)!r} stderr={_redact(r.stderr,500)!r}")
+
+
+def rent_vm(gpu_count: int) -> Tuple[str, Optional[str]]:
     """
-    Extract (user, host, port) from an ssh command.
-    Supports:
-      ssh user@host
-      ssh -p 2222 user@host
-      ssh user@host -p 2222
+    Returns (instance_id, ssh_command_if_present).
     """
-    port = 22
-    # port
-    m = re.search(r"\s-p\s+(\d+)", ssh_cmd)
-    if m:
-        port = int(m.group(1))
+    ensure_hcli_auth()
+    gpu_count = int(gpu_count)
+    args = ["rent", "ondemand", "--instance-type", "virtual-machine", "--gpu-count", str(gpu_count)]
+    r = run_hcli(args, timeout=120)
 
-    # user@host
-    m = re.search(r"\b([A-Za-z0-9._-]+)@([A-Za-z0-9.\-]+)\b", ssh_cmd)
-    if not m:
-        return None
-    return m.group(1), m.group(2), port
+    out = (r.stdout or "") + "\n" + (r.stderr or "")
+    if r.rc != 0:
+        raise RuntimeError(f"rent failed rc={r.rc} out_head={_redact(out,500)!r}")
 
-
-# ---------------------------
-# SSH bootstrap
-# ---------------------------
-def write_ssh_key() -> str:
-    if not SSH_PRIVATE_KEY.strip():
-        raise RuntimeError("SSH_PRIVATE_KEY secret is empty.")
-    key_path = "/tmp/hyperbolic_ssh_key"
-    with open(key_path, "w", encoding="utf-8") as f:
-        f.write(SSH_PRIVATE_KEY.strip() + "\n")
-    os.chmod(key_path, 0o600)
-    return key_path
-
-
-def ssh_run(host: str, port: int, user: str, key_path: str, remote_bash: str, timeout: int = 900) -> subprocess.CompletedProcess:
-    cmd = [
-        "ssh",
-        "-i", key_path,
-        "-p", str(port),
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        f"{user}@{host}",
-        "bash", "-lc", remote_bash,
+    # Try to extract instance_id
+    instance_id = ""
+    patterns = [
+        r'instance[_\s-]*id["\s:=]+([a-zA-Z0-9\-]+)',
+        r'Instance\s*ID\s*[:=]\s*([a-zA-Z0-9\-]+)',
+        r'"instance_id"\s*:\s*"([^"]+)"',
     ]
-    return run_cmd(cmd, timeout=timeout)
+    for pat in patterns:
+        m = re.search(pat, out, flags=re.IGNORECASE)
+        if m:
+            instance_id = m.group(1).strip()
+            break
+    if not instance_id:
+        # Sometimes CLI prints a full JSON blob; try parse JSON fragment
+        try:
+            j = _parse_json_or_raise(out, "hyperbolic rent")
+            if isinstance(j, dict):
+                instance_id = str(j.get("instance_id") or j.get("id") or "")
+        except Exception:
+            pass
+
+    # Try extract ssh command line
+    ssh_cmd = None
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("ssh "):
+            ssh_cmd = line
+            break
+
+    if not instance_id:
+        raise RuntimeError(f"Could not determine instance_id after rent. rent_stdout_head={_redact(out,500)!r}")
+
+    return instance_id, ssh_cmd
 
 
-def bootstrap_executor_vm(instance_id: str, host: str, port: int, ssh_user: str, key_path: str):
+# ----------------------------
+# SSH bootstrap
+# ----------------------------
+
+def _write_temp_ssh_key() -> str:
+    if not SSH_PRIVATE_KEY.strip():
+        raise RuntimeError("SSH_PRIVATE_KEY missing in env")
+    fd, path = tempfile.mkstemp(prefix="hyperbolic_ssh_", text=True)
+    os.write(fd, SSH_PRIVATE_KEY.encode("utf-8"))
+    os.close(fd)
+    os.chmod(path, 0o600)
+    return path
+
+
+def _ssh_run(ssh_cmd: str, remote_script: str, timeout: int = 600) -> None:
     """
-    Writes /data/secrets/b2.env + /data/secrets/hyper_executor.env on the Hyperbolic VM,
-    installs /data/bin/hyper_executor_loop.sh (curl), installs/enables systemd unit.
+    Run a remote bash script using an ssh command we got from Hyperbolic CLI output.
+    We append our own options to avoid prompts.
+    """
+    key_path = _write_temp_ssh_key()
+    try:
+        base = shlex.split(ssh_cmd)
+
+        # If the ssh command already includes -i, keep it; else add ours.
+        if "-i" not in base:
+            base += ["-i", key_path]
+
+        # Avoid host key prompts in Fly
+        base += [
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10",
+        ]
+
+        # Execute the remote script
+        remote = "bash -lc " + shlex.quote(remote_script)
+        cmd = base + [remote]
+
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"ssh bootstrap failed rc={p.returncode} stdout={_redact(p.stdout,800)!r} stderr={_redact(p.stderr,800)!r}"
+            )
+    finally:
+        try:
+            os.remove(key_path)
+        except Exception:
+            pass
+
+
+def bootstrap_vm_over_ssh(ssh_cmd: str) -> None:
+    """
+    Installs executor loop script + systemd unit + secrets on the VM.
     """
     if not EXECUTOR_TOKEN:
-        raise RuntimeError("EXECUTOR_TOKEN missing in Fly secrets/env.")
+        raise RuntimeError("EXECUTOR_TOKEN missing in env (needed on VM)")
 
-    # Build env file contents locally (then base64 to avoid quoting issues)
-    b2_env = "\n".join([
-        f"B2_SYNC={B2_SYNC}",
-        f"B2_BUCKET={B2_BUCKET}",
-        f"B2_S3_ENDPOINT={B2_S3_ENDPOINT}",
-        f"AWS_ACCESS_KEY_ID={AWS_ACCESS_KEY_ID}",
-        f"AWS_SECRET_ACCESS_KEY={AWS_SECRET_ACCESS_KEY}",
-        f"AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}",
-        "",
-    ])
-    hyper_exec_env = "\n".join([
-        f'EXECUTOR_TOKEN="{EXECUTOR_TOKEN}"',
-        f'BRAIN_URL="{BRAIN_URL}"',
-        f'ASSIGNED_WORKER_ID="{ASSIGNED_WORKER_ID}"',
-        "POLL_SECONDS=3",
-        "IDLE_SECONDS=3600",
-        f'EXECUTOR_ID="exec-{instance_id}"',
-        "",
-    ])
+    # Remote script: careful quoting, NO python f-string injection inside the worker source.
+    script = textwrap.dedent(f"""
+        set -euo pipefail
 
-    b2_b64 = base64.b64encode(b2_env.encode("utf-8")).decode("ascii")
-    ex_b64 = base64.b64encode(hyper_exec_env.encode("utf-8")).decode("ascii")
+        sudo mkdir -p /data/secrets /data/bin
 
-    # Use sudo where needed
-    remote = f"""
-set -euo pipefail
+        # B2 env
+        sudo bash -c 'cat > /data/secrets/b2.env << "EOF"
+B2_SYNC={B2_SYNC}
+B2_BUCKET={B2_BUCKET}
+B2_S3_ENDPOINT={B2_S3_ENDPOINT}
+AWS_ACCESS_KEY_ID={AWS_ACCESS_KEY_ID}
+AWS_SECRET_ACCESS_KEY={AWS_SECRET_ACCESS_KEY}
+AWS_DEFAULT_REGION={AWS_DEFAULT_REGION}
+EOF'
+        sudo chmod 600 /data/secrets/b2.env
 
-sudo mkdir -p /data/secrets /data/bin
+        # Executor env
+        sudo bash -c 'cat > /data/secrets/hyper_executor.env << "EOF"
+EXECUTOR_TOKEN="{EXECUTOR_TOKEN}"
+BRAIN_URL="{BRAIN_URL}"
+ASSIGNED_WORKER_ID="{ASSIGNED_WORKER_ID}"
+POLL_SECONDS=3
+IDLE_SECONDS=3600
+EXECUTOR_ID="exec-$(hostname)"
+EOF'
+        sudo chmod 600 /data/secrets/hyper_executor.env
 
-echo "{b2_b64}" | base64 -d | sudo tee /data/secrets/b2.env >/dev/null
-echo "{ex_b64}" | base64 -d | sudo tee /data/secrets/hyper_executor.env >/dev/null
-sudo chmod 600 /data/secrets/b2.env /data/secrets/hyper_executor.env
+        # Download loop script
+        sudo curl -fsSL {shlex.quote(EXECUTOR_LOOP_URL)} -o /data/bin/hyper_executor_loop.sh
+        sudo chmod +x /data/bin/hyper_executor_loop.sh
 
-sudo curl -fsSL "{EXECUTOR_LOOP_URL}" -o /data/bin/hyper_executor_loop.sh
-sudo chmod +x /data/bin/hyper_executor_loop.sh
-
-sudo tee /etc/systemd/system/hyper-executor.service >/dev/null <<'EOF'
+        # systemd unit
+        sudo tee /etc/systemd/system/hyper-executor.service >/dev/null << "EOF"
 [Unit]
 Description=Hyperbolic GPU Executor Loop
 After=network-online.target docker.service
@@ -363,188 +479,171 @@ RestartSec=2
 WantedBy=multi-user.target
 EOF
 
-sudo systemctl daemon-reload
-sudo systemctl enable --now hyper-executor.service
-sudo systemctl restart hyper-executor.service
+        sudo systemctl daemon-reload
+        sudo systemctl enable --now hyper-executor.service
 
-echo "BOOTSTRAP_OK"
-""".strip()
+        echo "BOOTSTRAP_OK"
+    """).strip()
 
-    p = ssh_run(host, port, ssh_user, key_path, remote, timeout=900)
-    if p.returncode != 0 or "BOOTSTRAP_OK" not in (p.stdout or ""):
-        raise RuntimeError(
-            f"bootstrap failed rc={p.returncode} stdout_head={p.stdout[:600]!r} stderr_head={p.stderr[:600]!r}"
-        )
+    _ssh_run(ssh_cmd, script, timeout=900)
 
 
-# ---------------------------
-# Hyperbolic actions (CLI)
-# ---------------------------
-def hyperbolic_instances_json() -> List[Dict[str, Any]]:
-    """
-    Best-effort. If Hyperbolic returns non-JSON (your current situation), we return [] but log full context.
-    """
-    ensure_hyperbolic_auth()
-    e = hyperbolic_env()
-    p = run_cmd(["hyperbolic", "instances", "--json"], env=e, timeout=30)
-    out = (p.stdout or "").strip()
-    err = (p.stderr or "").strip()
+# ----------------------------
+# Autoscaler logic
+# ----------------------------
 
-    if p.returncode != 0:
-        log.warning("hyperbolic instances rc=%s stdout_head=%r stderr_head=%r", p.returncode, out[:400], err[:400])
-        return []
-
-    try:
-        j = json.loads(out)
-        if isinstance(j, list):
-            return j
-        # some CLIs return {"instances":[...]}
-        if isinstance(j, dict) and "instances" in j and isinstance(j["instances"], list):
-            return j["instances"]
-    except Exception:
-        log.warning("hyperbolic instances --json returned non-JSON output. stdout_head=%r stderr_head=%r", out[:500], err[:500])
-        return []
-
-    return []
-
-
-def hyperbolic_rent_vm(gpu_count: int) -> Tuple[str, str, str, int]:
-    """
-    Rent a VM with gpu_count and return:
-      (instance_id, raw_ssh_cmd, host, port)
-    """
-    ensure_hyperbolic_auth()
-    e = hyperbolic_env()
-
-    p = run_cmd(
-        ["hyperbolic", "rent", "ondemand", "--instance-type", "virtual-machine", "--gpu-count", str(gpu_count)],
-        env=e,
-        timeout=120,
-    )
-    out = (p.stdout or "")
-    err = (p.stderr or "")
-
-    if p.returncode != 0:
-        raise RuntimeError(f"rent failed rc={p.returncode} stdout_head={out[:600]!r} stderr_head={err[:600]!r}")
-
-    instance_id = parse_instance_id(out)
-    ssh_cmd = parse_ssh_cmd(out)
-
-    if not instance_id:
-        raise RuntimeError(f"Could not determine instance_id after rent. rent_stdout_head={out[:700]!r}")
-
-    if not ssh_cmd:
-        raise RuntimeError(f"Could not parse ssh command from rent output. rent_stdout_head={out[:700]!r}")
-
-    parsed = parse_ssh_target(ssh_cmd)
-    if not parsed:
-        raise RuntimeError(f"Could not parse ssh user/host/port. ssh_cmd={ssh_cmd!r}")
-
-    ssh_user, host, port = parsed
-    return instance_id, ssh_cmd, host, port
-
-
-def hyperbolic_terminate(instance_id: str):
-    ensure_hyperbolic_auth()
-    e = hyperbolic_env()
-    p = run_cmd(["hyperbolic", "terminate", instance_id], env=e, timeout=60)
-    if p.returncode != 0:
-        raise RuntimeError(f"terminate failed rc={p.returncode} stdout_head={p.stdout[:400]!r} stderr_head={p.stderr[:400]!r}")
-
-
-# ---------------------------
-# Autoscaler tick
-# ---------------------------
-def desired_vm_count(unclaimed: int, inflight: int) -> int:
-    if unclaimed <= 0 and inflight <= 0:
+def compute_want_vms(unclaimed_backlog: int) -> int:
+    if unclaimed_backlog <= 0:
         return 0
-    want = 0
-    if unclaimed > 0:
-        want = (unclaimed - 1) // BACKLOG_PER_VM + 1
-    # never scale down below inflight jobs (so we don't kill active processing)
-    want = max(want, inflight)
-    return want
+    return int(math.ceil(unclaimed_backlog / float(BACKLOG_PER_VM)))
 
 
-def autoscaler_tick():
+def filter_active_instances(raw: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Keep only "active" instances. The exact schema depends on CLI.
+    We attempt common keys: status/state and instance id keys.
+    """
+    out = []
+    for inst in raw:
+        if not isinstance(inst, dict):
+            continue
+        status = str(inst.get("status") or inst.get("state") or "").upper()
+        # If status missing, keep it (better than terminating incorrectly)
+        if status and status not in ("RUNNING", "ACTIVE", "STARTED"):
+            continue
+        if INSTANCE_NAME_PREFIX:
+            name = str(inst.get("name") or inst.get("instance_name") or "")
+            if not name.startswith(INSTANCE_NAME_PREFIX):
+                continue
+        out.append(inst)
+    return out
+
+
+def get_instance_id(inst: Dict[str, Any]) -> str:
+    return str(inst.get("instance_id") or inst.get("id") or inst.get("instanceId") or "").strip()
+
+
+def get_instance_ssh(inst: Dict[str, Any]) -> Optional[str]:
+    """
+    If CLI JSON includes ssh command or connection string, use it.
+    Otherwise return None.
+    """
+    for k in ("ssh", "ssh_command", "sshCommand", "connect", "connection"):
+        v = inst.get(k)
+        if isinstance(v, str) and v.strip().startswith("ssh "):
+            return v.strip()
+    return None
+
+
+def autoscaler_tick() -> None:
     unclaimed, inflight = backlog_counts()
-    want_vms = desired_vm_count(unclaimed, inflight)
-    tracked = list_tracked_vms()
-    have_vms = len(tracked)
+    want = compute_want_vms(unclaimed)
 
-    log.info("backlog=%s inflight=%s want_vms=%s have_vms=%s", unclaimed, inflight, want_vms, have_vms)
+    # If Hyperbolic list API is broken (404), we still want clean logs and no crash-loop.
+    have = 0
+    instances: List[Dict[str, Any]] = []
+    try:
+        instances = filter_active_instances(list_instances())
+        have = len(instances)
+    except Exception as e:
+        # IMPORTANT: don’t crash the worker; log and proceed to rent attempts (or termination if want=0)
+        log.error(f"autoscaler error listing instances: {e}")
+        instances = []
+        have = 0
 
-    # Scale up
-    if want_vms > have_vms:
-        missing = want_vms - have_vms
-        log.info("need %s more VM(s)", missing)
+    log.info(f"backlog={unclaimed} inflight={inflight} want_vms={want} have_vms={have}")
 
-        key_path = write_ssh_key()
+    # No backlog => terminate everything we can see (only if we can list).
+    if want == 0:
+        if have == 0:
+            return
+        # If jobs are still inflight, do not kill instances.
+        if inflight > 0:
+            log.info("inflight>0; not terminating instances yet")
+            return
 
-        for _ in range(missing):
-            last_err = None
-            for g in GPU_CHOICES:
-                try:
-                    log.info("renting %sx GPU VM on Hyperbolic...", g)
-                    instance_id, ssh_cmd, host, port = hyperbolic_rent_vm(g)
-
-                    # You told me: 1 job per VM for now; executor_id must be deterministic
-                    # We keep ssh_user from the rent output (more accurate than secret default)
-                    parsed = parse_ssh_target(ssh_cmd)
-                    assert parsed is not None
-                    ssh_user, _, _ = parsed
-
-                    log.info("rented instance_id=%s host=%s port=%s ssh_user=%s", instance_id, host, port, ssh_user)
-
-                    # Bootstrap executor on the rented VM
-                    bootstrap_executor_vm(instance_id, host, port, ssh_user, key_path)
-
-                    # Track in DB
-                    track_vm(instance_id, g, ssh_user, host, port, ssh_cmd)
-
-                    # Success -> break gpu choice loop
-                    last_err = None
-                    break
-                except Exception as e:
-                    last_err = e
-                    log.info("rent attempt failed for gpu_count=%s: %s", g, str(e))
-                    continue
-
-            if last_err is not None:
-                raise RuntimeError(f"could not rent+bootstrap any VM size: {last_err}")
-
-    # Scale down (only when truly nothing is running and no backlog)
-    # If you later want aggressive scale-down, we can do it safely by mapping executor_id -> instance_id.
-    if want_vms < have_vms and unclaimed == 0 and inflight == 0:
-        extra = have_vms - want_vms
-        log.info("scaling down: terminating %s VM(s)", extra)
-
-        # terminate oldest first
-        for vm in tracked[:extra]:
-            iid = vm["instance_id"]
+        for inst in instances:
+            iid = get_instance_id(inst)
+            if not iid:
+                continue
             try:
-                log.info("terminating instance_id=%s ...", iid)
-                hyperbolic_terminate(iid)
-                mark_terminated(iid)
-                log.info("terminated instance_id=%s", iid)
+                log.info(f"terminating instance {iid} (no backlog)")
+                terminate_instance(iid)
             except Exception as e:
-                log.info("terminate failed for %s: %s", iid, str(e))
+                log.error(f"terminate failed for {iid}: {e}")
+        return
+
+    # Need more instances
+    if have >= want:
+        return
+
+    need = want - have
+    log.info(f"need {need} more VM(s)")
+
+    for _ in range(need):
+        last_err = None
+        instance_id = None
+        ssh_cmd = None
+
+        for g in GPU_FALLBACKS:
+            if g > MAX_GPUS:
+                continue
+            try:
+                log.info(f"renting {g}x GPU VM on Hyperbolic...")
+                instance_id, ssh_cmd = rent_vm(g)
+                log.info(f"rented instance_id={instance_id}")
+
+                # Bootstrap if we have ssh command
+                if ssh_cmd:
+                    log.info(f"bootstrapping instance_id={instance_id} over SSH...")
+                    bootstrap_vm_over_ssh(ssh_cmd)
+                    log.info(f"bootstrap complete for instance_id={instance_id}")
+                else:
+                    log.warning(f"no ssh command found in rent output for instance_id={instance_id}; bootstrap skipped")
+                break
+            except Exception as e:
+                last_err = e
+                log.info(f"rent attempt failed for gpu_count={g}: {e}")
+
+        if not instance_id:
+            raise RuntimeError(f"autoscaler error: could not rent any VM size: {last_err}")
 
 
-# ---------------------------
-# Main loop
-# ---------------------------
-def main():
-    log.info("worker boot: poll=%ss backlog_per_vm=%s hyper_api_base=%s", POLL_SECONDS, BACKLOG_PER_VM, HYPERBOLIC_API_BASE)
-    ensure_tables()
+def main() -> None:
+    # Validate required env early (so failures are obvious)
+    missing = []
+    if not os.getenv("DATABASE_URL"):
+        missing.append("DATABASE_URL")
+    if not HYPERBOLIC_API_KEY:
+        missing.append("HYPERBOLIC_API_KEY")
+    if not EXECUTOR_TOKEN:
+        missing.append("EXECUTOR_TOKEN")
+    if not SSH_PRIVATE_KEY.strip():
+        missing.append("SSH_PRIVATE_KEY")
+    if missing:
+        raise SystemExit(f"Missing required env: {', '.join(missing)}")
 
-    while True:
+    # Basic sanity: print CLI location (helps debugging container builds)
+    log.info(f"using hyperbolic bin: {_which(HYPERBOLIC_BIN)}")
+    if HYPERBOLIC_API_BASE_URL:
+        log.info(f"HYPERBOLIC_API_BASE_URL override set")
+
+    # Loop
+    stop = False
+
+    def _handle(_sig, _frame):
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGINT, _handle)
+
+    while not stop:
         try:
             autoscaler_tick()
         except Exception as e:
-            # Never crash the whole worker; log the real error
-            log.error("autoscaler error", exc_info=True)
-        time.sleep(POLL_SECONDS)
+            log.error(f"autoscaler error: {e}")
+        time.sleep(TICK_SECONDS)
 
 
 if __name__ == "__main__":
