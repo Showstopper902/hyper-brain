@@ -1,406 +1,323 @@
-# app/worker.py
+"""Fly worker process: autoscale RunPod pods for this brain.
+
+This worker does *not* execute jobs. It only:
+  - reads backlog from Postgres
+  - lists existing RunPod pods with a name prefix
+  - creates/terminates pods to reach the desired count
+
+Scaling rule (default):
+  - backlog = count(jobs where status='RUNNING' and executor_id is NULL
+                   and assigned_worker_id matches this brain)
+  - want_pods = 0 if backlog == 0 else ceil(backlog / BACKLOG_PER_POD)
+
+RunPod pods should run an "executor loop" container which calls:
+  POST /executors/claim and POST /executors/complete on this brain.
+"""
+
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import math
 import os
-import sys
+import random
+import string
 import time
-import traceback
-import urllib.parse
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg
+
+from .runpod_client import RunPodClient, RunPodError
+
 
 LOG = logging.getLogger("brain-worker")
 
 
-# ----------------------------
-# Small utilities
-# ----------------------------
-
-def _env(name: str, default: Optional[str] = None) -> Optional[str]:
+def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    return v if v not in (None, "") else default
-
-
-def _now() -> float:
-    return time.time()
-
-
-def _sleep_s(s: float) -> None:
-    time.sleep(max(0.0, s))
-
-
-def _head(s: str, n: int = 500) -> str:
-    s = s or ""
-    return s[:n]
-
-
-# ----------------------------
-# DB backlog counting
-#   We try psycopg (v3), psycopg2, then SQLAlchemy if installed.
-#   This keeps the worker from dying depending on which lib is in requirements.
-# ----------------------------
-
-BACKLOG_SQL = "SELECT COUNT(*) FROM jobs WHERE status='RUNNING' AND executor_id IS NULL"
-INFLIGHT_SQL = "SELECT COUNT(*) FROM jobs WHERE status='RUNNING' AND executor_id IS NOT NULL"
-
-def get_job_counts() -> Tuple[int, int]:
-    db_url = _env("DATABASE_URL")
-    if not db_url:
-        return (0, 0)
-
-    # Try psycopg (v3)
+    if v is None or v == "":
+        return default
     try:
-        import psycopg  # type: ignore
-        with psycopg.connect(db_url) as conn:
-            with conn.cursor() as cur:
-                cur.execute(BACKLOG_SQL)
-                backlog = int(cur.fetchone()[0])
-                cur.execute(INFLIGHT_SQL)
-                inflight = int(cur.fetchone()[0])
-        return backlog, inflight
-    except Exception:
-        pass
-
-    # Try psycopg2
-    try:
-        import psycopg2  # type: ignore
-        conn = psycopg2.connect(db_url)
-        try:
-            cur = conn.cursor()
-            cur.execute(BACKLOG_SQL)
-            backlog = int(cur.fetchone()[0])
-            cur.execute(INFLIGHT_SQL)
-            inflight = int(cur.fetchone()[0])
-            cur.close()
-            return backlog, inflight
-        finally:
-            conn.close()
-    except Exception:
-        pass
-
-    # Try SQLAlchemy (if present)
-    try:
-        from sqlalchemy import create_engine, text  # type: ignore
-        eng = create_engine(db_url, pool_pre_ping=True)
-        with eng.connect() as c:
-            backlog = int(c.execute(text(BACKLOG_SQL)).scalar_one())
-            inflight = int(c.execute(text(INFLIGHT_SQL)).scalar_one())
-        return backlog, inflight
-    except ModuleNotFoundError as e:
-        raise RuntimeError(
-            f"Cannot read backlog: no postgres client library installed. "
-            f"Install one of: psycopg, psycopg2-binary, sqlalchemy. ({e})"
-        )
-    except Exception as e:
-        raise RuntimeError(f"Cannot read backlog from DB: {e}")
+        return int(v)
+    except ValueError:
+        raise RuntimeError(f"{name} must be an int, got {v!r}")
 
 
-# ----------------------------
-# Hyperbolic on-demand (tRPC) client
-#   Matches the browser calls you captured:
-#   /v2/ondemand.getRentalOptions
-#   /v2/ondemand.getActiveVirtualMachineRentals
-#   /v2/ondemand.createVirtualMachineRental
-#   /v2/ondemand.terminateVirtualMachineRental
-# ----------------------------
-
-@dataclass
-class HyperbolicTRPC:
-    base_url: str
-    token: str
-    timeout_s: int = 20
-
-    def _headers(self) -> Dict[str, str]:
-        # Some stacks accept api keys in different headers. This is harmless if ignored.
-        return {
-            "accept": "*/*",
-            "content-type": "application/json",
-            "trpc-accept": "application/jsonl",
-            "x-trpc-source": "brain-worker",
-            "authorization": f"Bearer {self.token}",
-            "x-api-key": self.token,
-            "X-API-Key": self.token,
-        }
-
-    def _url(self, procedure: str, query: str) -> str:
-        return f"{self.base_url}/v2/{procedure}{query}"
-
-    def _request(self, method: str, url: str, body: Optional[bytes]) -> Tuple[int, str]:
-        req = urllib.request.Request(url, method=method, data=body, headers=self._headers())
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
-                raw = resp.read()
-                # response is usually gzip in browsers; urllib handles transparently sometimes,
-                # but if not, we still treat as bytes->utf-8 best-effort:
-                txt = raw.decode("utf-8", errors="replace")
-                return resp.status, txt
-        except Exception as e:
-            # Normalize urllib errors that still contain response bodies
-            if hasattr(e, "code"):
-                code = getattr(e, "code", 0) or 0
-                try:
-                    raw = e.read()  # type: ignore
-                    txt = raw.decode("utf-8", errors="replace")
-                except Exception:
-                    txt = str(e)
-                return int(code), txt
-            raise
-
-    def _parse_trpc(self, txt: str) -> Any:
-        """
-        tRPC batch responses commonly look like:
-          [{"result":{"data":{"json": ...}}}]
-        sometimes with JSONL lines. We support both.
-        """
-        s = (txt or "").strip()
-        if not s:
-            raise ValueError("empty response")
-
-        # JSON array
-        if s.startswith("["):
-            arr = json.loads(s)
-            return arr
-
-        # JSONL: one json object per line
-        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-        if not lines:
-            raise ValueError("no JSON lines")
-        objs = [json.loads(ln) for ln in lines]
-        return objs
-
-    def _unwrap_json(self, parsed: Any) -> Any:
-        """
-        Unwrap the first batch item into its `result.data.json` payload if present.
-        """
-        if isinstance(parsed, list) and parsed:
-            item = parsed[0]
-            if isinstance(item, dict):
-                # tRPC batch
-                j = item
-                for k in ("result", "data", "json"):
-                    if isinstance(j, dict) and k in j:
-                        j = j[k]
-                    else:
-                        break
-                return j
-        return parsed
-
-    def get_rental_options(self) -> Any:
-        input_param = urllib.parse.quote(json.dumps({"0": {"json": {}}}))
-        url = self._url("ondemand.getRentalOptions", f"?batch=1&input={input_param}")
-        code, txt = self._request("GET", url, None)
-        if code != 200:
-            raise RuntimeError(f"getRentalOptions HTTP {code}: {_head(txt)}")
-        return self._unwrap_json(self._parse_trpc(txt))
-
-    def get_active_rentals(self) -> List[Dict[str, Any]]:
-        input_param = urllib.parse.quote(json.dumps({"0": {"json": {}}}))
-        url = self._url("ondemand.getActiveVirtualMachineRentals", f"?batch=1&input={input_param}")
-        code, txt = self._request("GET", url, None)
-        if code != 200:
-            raise RuntimeError(f"getActiveVirtualMachineRentals HTTP {code}: {_head(txt)}")
-        data = self._unwrap_json(self._parse_trpc(txt))
-        # Expecting a list-ish structure; return best-effort
-        if isinstance(data, list):
-            return [x for x in data if isinstance(x, dict)]
-        if isinstance(data, dict) and "rentals" in data and isinstance(data["rentals"], list):
-            return [x for x in data["rentals"] if isinstance(x, dict)]
-        # Unknown schema, return empty instead of crashing
-        return []
-
-    def create_rental(
-        self,
-        gpu_count: int,
-        region: str,
-        gpu_type: str,
-        label: Optional[str],
-        term_type: str = "on-demand",
-        monitoring_enabled: Optional[bool] = None,
-    ) -> Any:
-        payload: Dict[str, Any] = {
-            "gpuCount": gpu_count,
-            "region": region,
-            "gpuType": gpu_type,
-            "label": label,
-            "termType": term_type,
-            "monitoringEnabled": monitoring_enabled,
-        }
-        # Match browser "meta.values" pattern so undefineds serialize consistently
-        meta = {"values": {"label": ["undefined"] if label is None else ["string"],
-                           "monitoringEnabled": ["undefined"] if monitoring_enabled is None else ["boolean"]}}
-        body = json.dumps({"0": {"json": payload, "meta": meta}}).encode("utf-8")
-        url = self._url("ondemand.createVirtualMachineRental", "?batch=1")
-        code, txt = self._request("POST", url, body)
-        if code != 200:
-            raise RuntimeError(f"createVirtualMachineRental HTTP {code}: {_head(txt)}")
-        return self._unwrap_json(self._parse_trpc(txt))
-
-    def terminate_rental(self, rental_id: int) -> Any:
-        body = json.dumps({"0": {"json": {"rentalId": int(rental_id)}}}).encode("utf-8")
-        url = self._url("ondemand.terminateVirtualMachineRental", "?batch=1")
-        code, txt = self._request("POST", url, body)
-        if code != 200:
-            raise RuntimeError(f"terminateVirtualMachineRental HTTP {code}: {_head(txt)}")
-        return self._unwrap_json(self._parse_trpc(txt))
+def _env_str(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    return default if v is None else v
 
 
-# ----------------------------
-# Autoscaler
-# ----------------------------
-
-class Autoscaler:
-    def __init__(self) -> None:
-        self.api_base = _env("HYPERBOLIC_API_BASE", "https://api.hyperbolic.xyz")
-        # IMPORTANT: prefer a real auth token if you have it
-        self.token = _env("HYPERBOLIC_AUTH_TOKEN") or _env("HYPERBOLIC_API_KEY") or ""
-        self.label_prefix = _env("HYPERBOLIC_LABEL_PREFIX", "hyper-brain")
-        self.region = _env("HYPERBOLIC_REGION", "us-central-1")
-        self.gpu_type = _env("HYPERBOLIC_GPU_TYPE", "h100")
-        self.gpu_per_vm = int(_env("HYPERBOLIC_GPU_PER_VM", "1") or "1")
-        self.max_backlog_per_vm = int(_env("MAX_BACKLOG_PER_VM", "250") or "250")
-        self.tick_s = float(_env("AUTOSCALER_TICK_SECONDS", "4") or "4")
-        self.cooldown_s = float(_env("AUTOSCALER_COOLDOWN_SECONDS", "15") or "15")
-        self._last_scale_at = 0.0
-
-        if not self.token:
-            raise RuntimeError("Missing HYPERBOLIC_AUTH_TOKEN or HYPERBOLIC_API_KEY")
-
-        self.h = HyperbolicTRPC(base_url=self.api_base, token=self.token)
-
-    def _want_vms(self, backlog: int) -> int:
-        if backlog <= 0:
-            return 0
-        return max(1, int(math.ceil(backlog / float(self.max_backlog_per_vm))))
-
-    def _is_ours(self, r: Dict[str, Any]) -> bool:
-        # We set label; if API doesn’t return label, we can’t filter — so we keep it conservative.
-        lab = r.get("label")
-        if isinstance(lab, str) and lab.startswith(self.label_prefix):
-            return True
-        return False
-
-    def _extract_rental_id(self, r: Dict[str, Any]) -> Optional[int]:
-        # browser terminate uses rentalId integer
-        rid = r.get("rentalId") or r.get("id")
-        try:
-            return int(rid)
-        except Exception:
-            return None
-
-    def _summarize_rentals(self, rentals: List[Dict[str, Any]]) -> str:
-        ids = []
-        for r in rentals:
-            rid = self._extract_rental_id(r)
-            if rid is not None:
-                ids.append(str(rid))
-        return ",".join(ids[:20]) + ("..." if len(ids) > 20 else "")
-
-    def tick(self) -> None:
-        backlog, inflight = get_job_counts()
-        want = self._want_vms(backlog)
-
-        rentals = self.h.get_active_rentals()
-        ours = [r for r in rentals if self._is_ours(r)]
-        have = len(ours)
-
-        LOG.info("backlog=%s inflight=%s want_vms=%s have_vms=%s", backlog, inflight, want, have)
-
-        # Cooldown to avoid thrashing on noisy counts
-        now = _now()
-        if now - self._last_scale_at < self.cooldown_s:
-            return
-
-        if have < want:
-            need = want - have
-            LOG.info("need %s more VM(s)", need)
-            for i in range(need):
-                label = f"{self.label_prefix}-{int(now)}-{i}"
-                LOG.info("renting %sx GPU VM on Hyperbolic (gpuType=%s region=%s label=%s)...",
-                         self.gpu_per_vm, self.gpu_type, self.region, label)
-                try:
-                    resp = self.h.create_rental(
-                        gpu_count=self.gpu_per_vm,
-                        region=self.region,
-                        gpu_type=self.gpu_type,
-                        label=label,
-                        term_type="on-demand",
-                        monitoring_enabled=None,
-                    )
-                    LOG.info("rent success: %s", _head(json.dumps(resp, default=str), 800))
-                except Exception as e:
-                    LOG.error("rent failed: %s", e)
-                    LOG.error("rent failed traceback:\n%s", traceback.format_exc())
-
-            self._last_scale_at = now
-
-        elif have > want:
-            excess = have - want
-            LOG.info("have %s excess VM(s); terminating...", excess)
-            # terminate arbitrary ones (best-effort). If API returns timestamps, you can sort here.
-            terminated = 0
-            for r in ours:
-                if terminated >= excess:
-                    break
-                rid = self._extract_rental_id(r)
-                if rid is None:
-                    continue
-                LOG.info("terminating rentalId=%s", rid)
-                try:
-                    resp = self.h.terminate_rental(rid)
-                    LOG.info("terminate success: %s", _head(json.dumps(resp, default=str), 500))
-                    terminated += 1
-                except Exception as e:
-                    LOG.error("terminate failed rentalId=%s: %s", rid, e)
-                    LOG.error("terminate traceback:\n%s", traceback.format_exc())
-
-            self._last_scale_at = now
+def _rand_suffix(n: int = 6) -> str:
+    return "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(n))
 
 
-def configure_logging() -> None:
-    lvl = (_env("LOG_LEVEL", "INFO") or "INFO").upper()
-    logging.basicConfig(
-        level=getattr(logging, lvl, logging.INFO),
-        format="%(asctime)s [%(levelname)s][brain-worker] %(message)s",
-        stream=sys.stdout,
+@dataclass(frozen=True)
+class Config:
+    database_url: str
+    assigned_worker_id: str
+
+    # RunPod
+    runpod_api_key: str
+    runpod_api_base: str
+    runpod_cloud_type: str
+    runpod_executor_image: str
+    runpod_name_prefix: str
+
+    # Scaling
+    backlog_per_pod: int
+    max_pods: int
+    poll_seconds: int
+    scale_down_grace_seconds: int
+
+    # Pod resources
+    container_disk_gb: int
+    volume_gb: int
+    min_vcpu: int
+    min_mem_gb: int
+
+    # Selection
+    gpu_ladder: List[str]
+    datacenter_ladder: List[str]
+
+    # Env pass-through
+    pod_env_passthrough: List[str]
+
+
+def load_config() -> Config:
+    database_url = _env_str("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("DATABASE_URL is required")
+
+    assigned_worker_id = _env_str("ASSIGNED_WORKER_ID")
+    if not assigned_worker_id:
+        raise RuntimeError("ASSIGNED_WORKER_ID is required")
+
+    runpod_api_key = _env_str("RUNPOD_API_KEY")
+    if not runpod_api_key:
+        raise RuntimeError("RUNPOD_API_KEY is required")
+
+    runpod_executor_image = _env_str("RUNPOD_EXECUTOR_IMAGE")
+    if not runpod_executor_image:
+        raise RuntimeError("RUNPOD_EXECUTOR_IMAGE is required")
+
+    runpod_api_base = _env_str("RUNPOD_API_BASE", "https://api.runpod.io")
+    # Using ALL gives the allocator the widest set of hosts; you can tighten
+    # this to SECURE later if you only want verified/secure providers.
+    runpod_cloud_type = _env_str("RUNPOD_CLOUD_TYPE", "ALL")
+    runpod_name_prefix = _env_str("RUNPOD_POD_NAME_PREFIX", "hyper-exec")
+
+    backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 250)
+    max_pods = _env_int("RUNPOD_MAX_PODS", 25)
+    poll_seconds = _env_int("RUNPOD_POLL_SECONDS", 5)
+    scale_down_grace_seconds = _env_int("RUNPOD_SCALE_DOWN_GRACE_SECONDS", 0)
+
+    container_disk_gb = _env_int("RUNPOD_CONTAINER_DISK_GB", 50)
+    volume_gb = _env_int("RUNPOD_VOLUME_GB", 80)
+    min_vcpu = _env_int("RUNPOD_MIN_VCPU", 4)
+    min_mem_gb = _env_int("RUNPOD_MIN_MEM_GB", 16)
+
+    gpu_ladder = [s.strip() for s in _env_str(
+        "RUNPOD_GPU_LADDER",
+        "A40,RTX A6000,L40S,L40,RTX 6000 Ada,A100,H100,H200",
+    ).split(",") if s.strip()]
+
+    datacenter_ladder = [s.strip() for s in _env_str("RUNPOD_DATACENTER_LADDER", "").split(",") if s.strip()]
+
+    # Comma-separated list of env var names to pass through to the executor pod.
+    # Keep this list tight—only secrets/values the executor needs.
+    pod_env_passthrough = [s.strip() for s in _env_str(
+        "RUNPOD_POD_ENV_PASSTHROUGH",
+        "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION",
+    ).split(",") if s.strip()]
+
+    return Config(
+        database_url=database_url,
+        assigned_worker_id=assigned_worker_id,
+        runpod_api_key=runpod_api_key,
+        runpod_api_base=runpod_api_base,
+        runpod_cloud_type=runpod_cloud_type,
+        runpod_executor_image=runpod_executor_image,
+        runpod_name_prefix=runpod_name_prefix,
+        backlog_per_pod=backlog_per_pod,
+        max_pods=max_pods,
+        poll_seconds=poll_seconds,
+        scale_down_grace_seconds=scale_down_grace_seconds,
+        container_disk_gb=container_disk_gb,
+        volume_gb=volume_gb,
+        min_vcpu=min_vcpu,
+        min_mem_gb=min_mem_gb,
+        gpu_ladder=gpu_ladder,
+        datacenter_ladder=datacenter_ladder,
+        pod_env_passthrough=pod_env_passthrough,
     )
 
 
-def main() -> None:
-    configure_logging()
-    LOG.info("worker booting")
+def get_backlog_and_inflight(conn: psycopg.Connection, assigned_worker_id: str) -> Tuple[int, int]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+              SUM(CASE WHEN status='RUNNING' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
+              SUM(CASE WHEN status='RUNNING' AND executor_id IS NOT NULL THEN 1 ELSE 0 END) AS inflight
+            FROM jobs
+            WHERE assigned_worker_id = %s
+            """,
+            (assigned_worker_id,),
+        )
+        row = cur.fetchone()
+        backlog = int(row[0] or 0)
+        inflight = int(row[1] or 0)
+        return backlog, inflight
 
-    # Validate DB (optional)
-    try:
-        b, i = get_job_counts()
-        LOG.info("db ok (backlog=%s inflight=%s)", b, i)
-    except Exception as e:
-        LOG.error("db check failed (autoscaling will break): %s", e)
 
-    # Validate Hyperbolic auth + endpoint reachability
+def want_pods_for_backlog(backlog: int, backlog_per_pod: int) -> int:
+    if backlog <= 0:
+        return 0
+    return int(math.ceil(backlog / float(backlog_per_pod)))
+
+
+def filter_managed_pods(pods: List[Dict[str, Any]], name_prefix: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for p in pods:
+        name = (p.get("name") or "")
+        if not name.startswith(name_prefix):
+            continue
+        status = (p.get("desiredStatus") or "").upper()
+        if status in {"TERMINATED", "DELETED"}:
+            continue
+        out.append(p)
+    return out
+
+
+def pod_uptime_seconds(p: Dict[str, Any]) -> int:
+    rt = p.get("runtime") or {}
     try:
-        a = Autoscaler()
-        # quick probe to produce a clean error if auth is wrong
-        _ = a.h.get_rental_options()
-        LOG.info("hyperbolic probe ok (getRentalOptions)")
-    except Exception as e:
-        LOG.error("hyperbolic probe failed: %s", e)
-        LOG.error("This usually means your token/key is not accepted by /v2/ondemand.* endpoints.")
-        LOG.error("See notes below in chat on what token to use.")
-        # Don't crash the machine; keep looping so deploy succeeds and logs remain visible.
-        a = None  # type: ignore
+        return int(rt.get("uptimeInSeconds") or 0)
+    except Exception:
+        return 0
+
+
+def build_executor_env(cfg: Config) -> List[Dict[str, str]]:
+    env_items: List[Dict[str, str]] = []
+    for key in cfg.pod_env_passthrough:
+        val = os.getenv(key)
+        if val is None or val == "":
+            continue
+        env_items.append({"key": key, "value": val})
+    # Convenience: expose the worker prefix so executors can include it in logs.
+    env_items.append({"key": "RUNPOD_POD_NAME_PREFIX", "value": cfg.runpod_name_prefix})
+    return env_items
+
+
+def try_create_one_pod(client: RunPodClient, cfg: Config) -> Dict[str, Any]:
+    gpu_types = client.list_gpu_types()
+
+    # Build a resolved list of actual gpuTypeId strings to try.
+    resolved: List[str] = []
+    for token in cfg.gpu_ladder:
+        match = client.resolve_gpu_type_id(gpu_types, token, min_vram_gb=48, disallow_blackwell=True)
+        if match and match not in resolved:
+            resolved.append(match)
+
+    if not resolved:
+        raise RuntimeError("Could not resolve any GPU types from ladder; check RUNPOD_GPU_LADDER")
+
+    # We try: for gpu in resolved: for dc in [None] + datacenter_ladder
+    dcs = [None] + (cfg.datacenter_ladder or [])
+    last_err: Optional[BaseException] = None
+    for gpu_type_id in resolved:
+        for dc in dcs:
+            name = f"{cfg.runpod_name_prefix}-{_rand_suffix()}"
+            try:
+                LOG.info("creating RunPod pod name=%s gpu=%s dc=%s", name, gpu_type_id, dc or "(auto)")
+                pod = client.create_on_demand_pod(
+                    name=name,
+                    image_name=cfg.runpod_executor_image,
+                    gpu_count=1,
+                    gpu_type_id=gpu_type_id,
+                    cloud_type=cfg.runpod_cloud_type,
+                    container_disk_gb=cfg.container_disk_gb,
+                    volume_gb=cfg.volume_gb,
+                    min_vcpu=cfg.min_vcpu,
+                    min_mem_gb=cfg.min_mem_gb,
+                    env=build_executor_env(cfg),
+                    datacenter_id=dc,
+                )
+                return pod
+            except Exception as e:
+                last_err = e
+                LOG.warning("pod create failed gpu=%s dc=%s err=%s", gpu_type_id, dc or "(auto)", e)
+                continue
+
+    raise RuntimeError(f"All allocation attempts failed; last error: {last_err}")
+
+
+def autoscaler_loop() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s][%(name)s] %(message)s",
+    )
+    cfg = load_config()
+    client = RunPodClient(api_key=cfg.runpod_api_key, api_base=cfg.runpod_api_base)
+    conn = psycopg.connect(cfg.database_url, autocommit=True)
+
+    backlog_zero_since: Optional[float] = None
 
     while True:
         try:
-            if a is not None:
-                a.tick()
-        except Exception:
-            LOG.error("autoscaler error:\n%s", traceback.format_exc())
-        _sleep_s(float(_env("AUTOSCALER_TICK_SECONDS", "4") or "4"))
+            backlog, inflight = get_backlog_and_inflight(conn, cfg.assigned_worker_id)
+            want = want_pods_for_backlog(backlog, cfg.backlog_per_pod)
+            want = min(want, cfg.max_pods)
+
+            # Optional scale-down grace to avoid churn (disabled by default).
+            now = time.time()
+            if backlog == 0 and cfg.scale_down_grace_seconds > 0:
+                if backlog_zero_since is None:
+                    backlog_zero_since = now
+                if (now - backlog_zero_since) < cfg.scale_down_grace_seconds:
+                    want = max(want, 1)  # keep one warm pod
+            else:
+                backlog_zero_since = None
+
+            pods = filter_managed_pods(client.list_pods(), cfg.runpod_name_prefix)
+            have = len(pods)
+
+            LOG.info("backlog=%s inflight=%s want_pods=%s have_pods=%s", backlog, inflight, want, have)
+
+            if have < want:
+                need = want - have
+                LOG.info("need %s more pod(s)", need)
+                for _ in range(need):
+                    try_create_one_pod(client, cfg)
+                    time.sleep(0.25)
+
+            elif have > want:
+                extra = have - want
+                LOG.info("terminating %s pod(s)", extra)
+                # Terminate newest first (smallest uptime), so older pods stay warm.
+                pods_sorted = sorted(pods, key=pod_uptime_seconds)
+                for p in pods_sorted[:extra]:
+                    pid = p.get("id")
+                    if not pid:
+                        continue
+                    try:
+                        LOG.info("terminating pod id=%s name=%s", pid, p.get("name"))
+                        client.terminate_pod(str(pid))
+                    except Exception as e:
+                        LOG.warning("terminate failed id=%s err=%s", pid, e)
+
+        except (RunPodError, psycopg.Error) as e:
+            LOG.error("autoscaler error: %s", e, exc_info=True)
+        except Exception as e:
+            LOG.error("autoscaler error", exc_info=True)
+
+        time.sleep(cfg.poll_seconds)
+
+
+def main() -> None:
+    autoscaler_loop()
 
 
 if __name__ == "__main__":
