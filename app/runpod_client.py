@@ -46,7 +46,6 @@ class RunPodClient:
             raise RunPodError(f"RunPod HTTP {r.status_code}: {r.text[:500]}")
         data = r.json()
         if "errors" in data and data["errors"]:
-            # GraphQL errors often include useful messages
             msg = data["errors"][0].get("message") or str(data["errors"][0])
             raise RunPodError(f"RunPod GraphQL error: {msg}")
         return data.get("data") or {}
@@ -69,7 +68,10 @@ class RunPodClient:
         return out.get("gpuTypes") or []
 
     def list_pods(self) -> List[Dict[str, Any]]:
-        # Using `myself { pods { ... } }` is the simplest way to list your pods.
+        # NOTE:
+        # RunPod GraphQL schema does NOT expose gpuTypeId directly on Pod.
+        # It's either under `machine { gpuTypeId ... }` or not needed at all for autoscaling.
+        # We only need id/name/status/createdAt (+ optional uptime) to filter managed pods.
         q = """
         query myself {
           myself {
@@ -78,9 +80,13 @@ class RunPodClient:
               name
               desiredStatus
               createdAt
-              gpuTypeId
+              gpuCount
               runtime {
                 uptimeInSeconds
+              }
+              machine {
+                gpuTypeId
+                gpuDisplayName
               }
             }
           }
@@ -113,8 +119,12 @@ class RunPodClient:
             id
             name
             desiredStatus
-            gpuTypeId
             createdAt
+            gpuCount
+            machine {
+              gpuTypeId
+              gpuDisplayName
+            }
           }
         }
         """
@@ -123,7 +133,6 @@ class RunPodClient:
             "imageName": image_name,
             "cloudType": cloud_type,
             "gpuCount": gpu_count,
-            # prefer list form so RunPod can pick from a set if you choose to pass multiple
             "gpuTypeId": gpu_type_id,
             "containerDiskInGb": container_disk_gb,
             "startJupyter": False,
@@ -131,7 +140,6 @@ class RunPodClient:
             "supportPublicIp": False,
         }
         if env:
-            # GraphQL spec defines env as [EnvironmentVariableInput]
             inp["env"] = env
         if volume_gb and volume_gb > 0:
             inp["volumeInGb"] = volume_gb
@@ -176,7 +184,6 @@ class RunPodClient:
             if not disallow_blackwell:
                 return False
             n = (name or "").lower()
-            # Conservative block list. Extend as needed.
             return any(x in n for x in ["blackwell", "b200", "b100", "rtx pro 6000"])
 
         # First pass: exact match by id or displayName
