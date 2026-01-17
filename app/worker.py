@@ -16,7 +16,6 @@ RunPod pods should run an "executor loop" container which calls:
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -103,10 +102,14 @@ def load_config() -> Config:
         raise RuntimeError("RUNPOD_EXECUTOR_IMAGE is required")
 
     runpod_api_base = _env_str("RUNPOD_API_BASE", "https://api.runpod.io")
-    # Using ALL gives the allocator the widest set of hosts; you can tighten
-    # this to SECURE later if you only want verified/secure providers.
     runpod_cloud_type = _env_str("RUNPOD_CLOUD_TYPE", "ALL")
-    runpod_name_prefix = _env_str("RUNPOD_POD_NAME_PREFIX", "hyper-exec")
+
+    # IMPORTANT: accept either env var name (you previously used RUNPOD_NAME_PREFIX in places)
+    runpod_name_prefix = (
+        _env_str("RUNPOD_NAME_PREFIX", "").strip()
+        or _env_str("RUNPOD_POD_NAME_PREFIX", "").strip()
+        or "hyper-exec"
+    )
 
     backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 250)
     max_pods = _env_int("RUNPOD_MAX_PODS", 25)
@@ -118,19 +121,26 @@ def load_config() -> Config:
     min_vcpu = _env_int("RUNPOD_MIN_VCPU", 4)
     min_mem_gb = _env_int("RUNPOD_MIN_MEM_GB", 16)
 
-    gpu_ladder = [s.strip() for s in _env_str(
-        "RUNPOD_GPU_LADDER",
-        "A40,RTX A6000,L40S,L40,RTX 6000 Ada,A100,H100,H200",
-    ).split(",") if s.strip()]
+    gpu_ladder = [
+        s.strip()
+        for s in _env_str(
+            "RUNPOD_GPU_LADDER",
+            "A40,RTX A6000,L40S,L40,RTX 6000 Ada,A100,H100,H200",
+        ).split(",")
+        if s.strip()
+    ]
 
     datacenter_ladder = [s.strip() for s in _env_str("RUNPOD_DATACENTER_LADDER", "").split(",") if s.strip()]
 
     # Comma-separated list of env var names to pass through to the executor pod.
-    # Keep this list tight—only secrets/values the executor needs.
-    pod_env_passthrough = [s.strip() for s in _env_str(
-        "RUNPOD_POD_ENV_PASSTHROUGH",
-        "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION",
-    ).split(",") if s.strip()]
+    pod_env_passthrough = [
+        s.strip()
+        for s in _env_str(
+            "RUNPOD_POD_ENV_PASSTHROUGH",
+            "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION",
+        ).split(",")
+        if s.strip()
+    ]
 
     return Config(
         database_url=database_url,
@@ -206,15 +216,13 @@ def build_executor_env(cfg: Config) -> List[Dict[str, str]]:
         if val is None or val == "":
             continue
         env_items.append({"key": key, "value": val})
-    # Convenience: expose the worker prefix so executors can include it in logs.
-    env_items.append({"key": "RUNPOD_POD_NAME_PREFIX", "value": cfg.runpod_name_prefix})
+    env_items.append({"key": "RUNPOD_NAME_PREFIX", "value": cfg.runpod_name_prefix})
     return env_items
 
 
 def try_create_one_pod(client: RunPodClient, cfg: Config) -> Dict[str, Any]:
     gpu_types = client.list_gpu_types()
 
-    # Build a resolved list of actual gpuTypeId strings to try.
     resolved: List[str] = []
     for token in cfg.gpu_ladder:
         match = client.resolve_gpu_type_id(gpu_types, token, min_vram_gb=48, disallow_blackwell=True)
@@ -224,9 +232,9 @@ def try_create_one_pod(client: RunPodClient, cfg: Config) -> Dict[str, Any]:
     if not resolved:
         raise RuntimeError("Could not resolve any GPU types from ladder; check RUNPOD_GPU_LADDER")
 
-    # We try: for gpu in resolved: for dc in [None] + datacenter_ladder
     dcs = [None] + (cfg.datacenter_ladder or [])
     last_err: Optional[BaseException] = None
+
     for gpu_type_id in resolved:
         for dc in dcs:
             name = f"{cfg.runpod_name_prefix}-{_rand_suffix()}"
@@ -259,9 +267,17 @@ def autoscaler_loop() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s][%(name)s] %(message)s",
     )
+
     cfg = load_config()
+    LOG.info("worker booting (runpod autoscaler)")
+    LOG.info("runpod_name_prefix=%s cloud_type=%s api_base=%s", cfg.runpod_name_prefix, cfg.runpod_cloud_type, cfg.runpod_api_base)
+
     client = RunPodClient(api_key=cfg.runpod_api_key, api_base=cfg.runpod_api_base)
     conn = psycopg.connect(cfg.database_url, autocommit=True)
+
+    # Log an initial DB probe so it’s obvious the loop is alive
+    backlog, inflight = get_backlog_and_inflight(conn, cfg.assigned_worker_id)
+    LOG.info("db ok (backlog=%s inflight=%s)", backlog, inflight)
 
     backlog_zero_since: Optional[float] = None
 
@@ -271,13 +287,12 @@ def autoscaler_loop() -> None:
             want = want_pods_for_backlog(backlog, cfg.backlog_per_pod)
             want = min(want, cfg.max_pods)
 
-            # Optional scale-down grace to avoid churn (disabled by default).
             now = time.time()
             if backlog == 0 and cfg.scale_down_grace_seconds > 0:
                 if backlog_zero_since is None:
                     backlog_zero_since = now
                 if (now - backlog_zero_since) < cfg.scale_down_grace_seconds:
-                    want = max(want, 1)  # keep one warm pod
+                    want = max(want, 1)
             else:
                 backlog_zero_since = None
 
@@ -296,7 +311,6 @@ def autoscaler_loop() -> None:
             elif have > want:
                 extra = have - want
                 LOG.info("terminating %s pod(s)", extra)
-                # Terminate newest first (smallest uptime), so older pods stay warm.
                 pods_sorted = sorted(pods, key=pod_uptime_seconds)
                 for p in pods_sorted[:extra]:
                     pid = p.get("id")
@@ -310,7 +324,7 @@ def autoscaler_loop() -> None:
 
         except (RunPodError, psycopg.Error) as e:
             LOG.error("autoscaler error: %s", e, exc_info=True)
-        except Exception as e:
+        except Exception:
             LOG.error("autoscaler error", exc_info=True)
 
         time.sleep(cfg.poll_seconds)
