@@ -68,10 +68,9 @@ class RunPodClient:
         return out.get("gpuTypes") or []
 
     def list_pods(self) -> List[Dict[str, Any]]:
-        # NOTE:
-        # RunPod GraphQL schema does NOT expose gpuTypeId directly on Pod.
-        # It's either under `machine { gpuTypeId ... }` or not needed at all for autoscaling.
-        # We only need id/name/status/createdAt (+ optional uptime) to filter managed pods.
+        # IMPORTANT:
+        # RunPod schema does NOT expose gpuTypeId directly on Pod.
+        # It's under pod.machine.gpuTypeId (if present).
         q = """
         query myself {
           myself {
@@ -81,9 +80,7 @@ class RunPodClient:
               desiredStatus
               createdAt
               gpuCount
-              runtime {
-                uptimeInSeconds
-              }
+              runtime { uptimeInSeconds }
               machine {
                 gpuTypeId
                 gpuDisplayName
@@ -198,7 +195,7 @@ class RunPodClient:
             if token == gid or token.lower() == dname.lower():
                 return gid
 
-        # Second pass: allow substring match (helps when ladder uses 'A100 80GB' etc.)
+        # Second pass: substring match (helps if ladder uses "A100 80GB", etc.)
         t = token.lower()
         for g in gpu_types:
             gid = g.get("id")
