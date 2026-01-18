@@ -1,51 +1,47 @@
-# app/main.py
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
 
-from app.db import get_conn
-
-app = FastAPI()
+from .db import get_conn
 
 
-# ----------------------------
-# Auth
-# ----------------------------
-def _executor_token_expected() -> str:
-    tok = os.environ.get("EXECUTOR_TOKEN")
-    if not tok:
-        raise RuntimeError("Missing EXECUTOR_TOKEN in environment (Fly secret).")
-    return tok
+def _env(name: str, default: Optional[str] = None) -> str:
+    v = os.getenv(name)
+    return v if v is not None and v != "" else (default or "")
 
 
-def require_executor_auth(authorization: Optional[str] = Header(default=None)):
-    expected = _executor_token_expected()
-    if not authorization or not authorization.lower().startswith("bearer "):
+def _require_bearer_token(req: Request) -> str:
+    """Simple Bearer-token auth for executor <-> brain calls."""
+    auth = req.headers.get("authorization") or req.headers.get("Authorization")
+    if not auth or not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    got = authorization.split(" ", 1)[1].strip()
+    return auth.split(" ", 1)[1].strip()
+
+
+def require_executor_auth(req: Request) -> None:
+    expected = _env("EXECUTOR_TOKEN")
+    if not expected:
+        # Misconfiguration; fail closed.
+        raise HTTPException(status_code=500, detail="Server misconfigured: EXECUTOR_TOKEN not set")
+    got = _require_bearer_token(req)
     if got != expected:
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
-# ----------------------------
-# Models
-# ----------------------------
-class TrainJobRequest(BaseModel):
-    username: str
-    model_name: str
-
-
-class InferJobRequest(BaseModel):
-    username: str
-    model_name: str
-    # IMPORTANT: filename only (e.g. "test_song.wav"), NOT "input/test_song.wav"
-    input_key: str
+app = FastAPI()
 
 
 class ClaimRequest(BaseModel):
+    executor_id: str
     assigned_worker_id: str
+    hostname: Optional[str] = None
+    capabilities: Optional[Dict[str, Any]] = None
+
+
+class HeartbeatRequest(BaseModel):
+    job_id: str
     executor_id: str
 
 
@@ -54,114 +50,109 @@ class CompleteRequest(BaseModel):
     executor_id: str
     ok: bool
     error_text: Optional[str] = None
+    exit_code: Optional[int] = None
+    stdout: Optional[str] = None
+    stderr: Optional[str] = None
 
 
-# ----------------------------
-# Job creation
-# ----------------------------
-@app.post("/jobs/train")
-def create_train_job(req: TrainJobRequest):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into public.jobs (job_type, username, model_name)
-                values ('TRAIN', %s, %s)
-                returning job_id
-                """,
-                (req.username, req.model_name),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return {"job_id": row["job_id"]}
+def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a JSON-friendly dict, and include an `id` alias."""
+    out = dict(row)
+    # For backwards compat: executor_loop historically expected `id`.
+    if "job_id" in out and "id" not in out:
+        out["id"] = out["job_id"]
+    return out
 
 
-@app.post("/jobs/infer")
-def create_infer_job(req: InferJobRequest):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                insert into public.jobs (job_type, username, model_name, input_key)
-                values ('INFER', %s, %s, %s)
-                returning job_id
-                """,
-                (req.username, req.model_name, req.input_key),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return {"job_id": row["job_id"]}
+@app.post("/executors/claim")
+def executors_claim(payload: ClaimRequest, _: None = Depends(require_executor_auth)):
+    """Claim the oldest unclaimed RUNNING job for this worker."""
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                # Atomically claim one job.
+                cur.execute(
+                    """
+WITH candidate AS (
+  SELECT job_id
+  FROM jobs
+  WHERE status = 'RUNNING'
+    AND assigned_worker_id = %s
+    AND executor_id IS NULL
+  ORDER BY created_at ASC
+  FOR UPDATE SKIP LOCKED
+  LIMIT 1
+)
+UPDATE jobs j
+SET executor_id = %s,
+    claimed_at = NOW(),
+    heartbeat_at = NOW(),
+    started_at = NOW(),
+    attempts = COALESCE(attempts, 0) + 1
+FROM candidate c
+WHERE j.job_id = c.job_id
+RETURNING j.*
+                    """,
+                    (payload.assigned_worker_id, payload.executor_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return {"job": None}
+                # psycopg returns tuples unless configured; map columns.
+                cols = [d.name for d in cur.description]
+                job = {cols[i]: row[i] for i in range(len(cols))}
+                return {"job": _row_to_job(job)}
+    finally:
+        conn.close()
 
 
-# ----------------------------
-# Executor endpoints
-# ----------------------------
-@app.post("/executors/claim", dependencies=[Depends(require_executor_auth)])
-def executor_claim(req: ClaimRequest):
-    """
-    Claim the oldest RUNNING job for assigned_worker_id that doesn't have executor_id yet.
-    Uses FOR UPDATE SKIP LOCKED to safely distribute work among executors.
-    """
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                update public.jobs
-                   set executor_id = %s,
-                       claimed_at  = now()
-                 where job_id = (
-                    select job_id
-                      from public.jobs
-                     where status = 'RUNNING'
-                       and assigned_worker_id = %s
-                       and executor_id is null
-                     order by created_at asc
-                     for update skip locked
-                     limit 1
-                 )
-                 returning
-                   job_id, job_type, status,
-                   username, model_name,
-                   input_key,
-                   created_at, started_at, finished_at,
-                   assigned_worker_id, executor_id, claimed_at
-                """,
-                (req.executor_id, req.assigned_worker_id),
-            )
-            row = cur.fetchone()
-            conn.commit()
-
-    if not row:
-        return {"job": None}
-    return {"job": row}
+@app.post("/executors/heartbeat")
+def executors_heartbeat(payload: HeartbeatRequest, _: None = Depends(require_executor_auth)):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+UPDATE jobs
+SET heartbeat_at = NOW()
+WHERE job_id = %s AND executor_id = %s AND status = 'RUNNING'
+                    """,
+                    (payload.job_id, payload.executor_id),
+                )
+                if cur.rowcount != 1:
+                    raise HTTPException(status_code=404, detail="Job not found for executor")
+        return {"ok": True}
+    finally:
+        conn.close()
 
 
-@app.post("/executors/complete", dependencies=[Depends(require_executor_auth)])
-def executor_complete(req: CompleteRequest):
-    """
-    Mark SUCCEEDED / FAILED and write finished_at + error_text.
-    Guardrail: only the claiming executor can complete the job (executor_id must match).
-    """
-    new_status = "SUCCEEDED" if req.ok else "FAILED"
+@app.post("/executors/complete")
+def executors_complete(payload: CompleteRequest, _: None = Depends(require_executor_auth)):
+    conn = get_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                status = "SUCCEEDED" if payload.ok else "FAILED"
+                err = payload.error_text
+                if not payload.ok and not err:
+                    # Prefer stderr, otherwise a generic message.
+                    err = (payload.stderr or "").strip() or "Executor reported failure"
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                update public.jobs
-                   set status      = %s,
-                       finished_at = now(),
-                       error_text  = %s
-                 where job_id = %s
-                   and executor_id = %s
-                 returning job_id
-                """,
-                (new_status, req.error_text, req.job_id, req.executor_id),
-            )
-            row = cur.fetchone()
-            conn.commit()
-
-    if not row:
-        raise HTTPException(status_code=404, detail="Job not found for this executor_id")
-
-    return {"ok": True, "job_id": req.job_id, "status": new_status}
+                cur.execute(
+                    """
+UPDATE jobs
+SET status = %s,
+    finished_at = NOW(),
+    heartbeat_at = NOW(),
+    error_text = %s
+WHERE job_id = %s AND executor_id = %s
+                    """,
+                    (status, err, payload.job_id, payload.executor_id),
+                )
+                if cur.rowcount != 1:
+                    raise HTTPException(status_code=404, detail="Job not found for executor")
+        return {"ok": True}
+    finally:
+        conn.close()

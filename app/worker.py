@@ -16,6 +16,7 @@ RunPod pods should run an "executor loop" container which calls:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
@@ -70,6 +71,13 @@ class Config:
     poll_seconds: int
     scale_down_grace_seconds: int
 
+    # Lease/heartbeat-based cleanup for stuck inflight jobs
+    lease_seconds: int
+    max_attempts: int
+
+    # Keep a pod warm after backlog drains
+    cooldown_seconds: int
+
     # Pod resources
     container_disk_gb: int
     volume_gb: int
@@ -102,45 +110,39 @@ def load_config() -> Config:
         raise RuntimeError("RUNPOD_EXECUTOR_IMAGE is required")
 
     runpod_api_base = _env_str("RUNPOD_API_BASE", "https://api.runpod.io")
+    # Using ALL gives the allocator the widest set of hosts; you can tighten
+    # this to SECURE later if you only want verified/secure providers.
     runpod_cloud_type = _env_str("RUNPOD_CLOUD_TYPE", "ALL")
-
-    # IMPORTANT: accept either env var name (you previously used RUNPOD_NAME_PREFIX in places)
-    runpod_name_prefix = (
-        _env_str("RUNPOD_NAME_PREFIX", "").strip()
-        or _env_str("RUNPOD_POD_NAME_PREFIX", "").strip()
-        or "hyper-exec"
-    )
+    runpod_name_prefix = _env_str("RUNPOD_POD_NAME_PREFIX", "hyper-exec")
 
     backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 250)
     max_pods = _env_int("RUNPOD_MAX_PODS", 25)
     poll_seconds = _env_int("RUNPOD_POLL_SECONDS", 5)
+    # Deprecated: prefer RUNPOD_COOLDOWN_SECONDS (kept for backward compat)
     scale_down_grace_seconds = _env_int("RUNPOD_SCALE_DOWN_GRACE_SECONDS", 0)
+
+    lease_seconds = _env_int("LEASE_SECONDS", 900)
+    max_attempts = _env_int("MAX_ATTEMPTS", 3)
+    cooldown_seconds = _env_int("COOLDOWN_SECONDS", 180)
 
     container_disk_gb = _env_int("RUNPOD_CONTAINER_DISK_GB", 50)
     volume_gb = _env_int("RUNPOD_VOLUME_GB", 80)
     min_vcpu = _env_int("RUNPOD_MIN_VCPU", 4)
     min_mem_gb = _env_int("RUNPOD_MIN_MEM_GB", 16)
 
-    gpu_ladder = [
-        s.strip()
-        for s in _env_str(
-            "RUNPOD_GPU_LADDER",
-            "A40,RTX A6000,L40S,L40,RTX 6000 Ada,A100,H100,H200",
-        ).split(",")
-        if s.strip()
-    ]
+    gpu_ladder = [s.strip() for s in _env_str(
+        "RUNPOD_GPU_LADDER",
+        "A40,RTX A6000,L40S,L40,RTX 6000 Ada,A100,H100,H200",
+    ).split(",") if s.strip()]
 
     datacenter_ladder = [s.strip() for s in _env_str("RUNPOD_DATACENTER_LADDER", "").split(",") if s.strip()]
 
     # Comma-separated list of env var names to pass through to the executor pod.
-    pod_env_passthrough = [
-        s.strip()
-        for s in _env_str(
-            "RUNPOD_POD_ENV_PASSTHROUGH",
-            "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION",
-        ).split(",")
-        if s.strip()
-    ]
+    # Keep this list tight—only secrets/values the executor needs.
+    pod_env_passthrough = [s.strip() for s in _env_str(
+        "RUNPOD_POD_ENV_PASSTHROUGH",
+        "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION",
+    ).split(",") if s.strip()]
 
     return Config(
         database_url=database_url,
@@ -154,6 +156,10 @@ def load_config() -> Config:
         max_pods=max_pods,
         poll_seconds=poll_seconds,
         scale_down_grace_seconds=scale_down_grace_seconds,
+
+        lease_seconds=lease_seconds,
+        max_attempts=max_attempts,
+        cooldown_seconds=cooldown_seconds,
         container_disk_gb=container_disk_gb,
         volume_gb=volume_gb,
         min_vcpu=min_vcpu,
@@ -164,17 +170,88 @@ def load_config() -> Config:
     )
 
 
-def get_backlog_and_inflight(conn: psycopg.Connection, assigned_worker_id: str) -> Tuple[int, int]:
+def reap_stale_inflight(
+    conn: psycopg.Connection,
+    assigned_worker_id: str,
+    lease_seconds: int,
+    max_attempts: int,
+) -> Tuple[int, int]:
+    """Release or fail jobs that were claimed but stopped heartbeating.
+
+    Returns: (released_count, failed_count)
+    """
+    released = 0
+    failed = 0
+    # 1) fail jobs that have already exhausted attempts
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+               SET status = 'FAILED',
+                   finished_at = NOW(),
+                   error_text = COALESCE(error_text, '') ||
+                                CASE WHEN COALESCE(error_text,'') = '' THEN '' ELSE '\n' END ||
+                                'Lease expired (no heartbeat); max attempts exceeded',
+                   executor_id = NULL
+             WHERE assigned_worker_id = %s
+               AND status = 'RUNNING'
+               AND executor_id IS NOT NULL
+               AND COALESCE(heartbeat_at, claimed_at) < NOW() - (%s * INTERVAL '1 second')
+               AND COALESCE(attempts, 0) >= %s
+            """,
+            (assigned_worker_id, lease_seconds, max_attempts),
+        )
+        failed = cur.rowcount or 0
+    # 2) otherwise, release them back to backlog
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE jobs
+               SET executor_id = NULL,
+                   claimed_at = NULL,
+                   heartbeat_at = NULL,
+                   started_at = NULL,
+                   error_text = COALESCE(error_text, '') ||
+                                CASE WHEN COALESCE(error_text,'') = '' THEN '' ELSE '\n' END ||
+                                'Lease expired (no heartbeat); re-queued'
+             WHERE assigned_worker_id = %s
+               AND status = 'RUNNING'
+               AND executor_id IS NOT NULL
+               AND COALESCE(heartbeat_at, claimed_at) < NOW() - (%s * INTERVAL '1 second')
+               AND COALESCE(attempts, 0) < %s
+            """,
+            (assigned_worker_id, lease_seconds, max_attempts),
+        )
+        released = cur.rowcount or 0
+
+    if released or failed:
+        conn.commit()
+    return released, failed
+
+
+def get_backlog_and_inflight(
+    conn: psycopg.Connection,
+    assigned_worker_id: str,
+    lease_seconds: int,
+) -> Tuple[int, int]:
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT
               SUM(CASE WHEN status='RUNNING' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
-              SUM(CASE WHEN status='RUNNING' AND executor_id IS NOT NULL THEN 1 ELSE 0 END) AS inflight
+              SUM(
+                CASE
+                  WHEN status='RUNNING'
+                   AND executor_id IS NOT NULL
+                   AND COALESCE(heartbeat_at, claimed_at) >= NOW() - (%s * INTERVAL '1 second')
+                  THEN 1
+                  ELSE 0
+                END
+              ) AS inflight
             FROM jobs
             WHERE assigned_worker_id = %s
             """,
-            (assigned_worker_id,),
+            (lease_seconds, assigned_worker_id),
         )
         row = cur.fetchone()
         backlog = int(row[0] or 0)
@@ -216,13 +293,15 @@ def build_executor_env(cfg: Config) -> List[Dict[str, str]]:
         if val is None or val == "":
             continue
         env_items.append({"key": key, "value": val})
-    env_items.append({"key": "RUNPOD_NAME_PREFIX", "value": cfg.runpod_name_prefix})
+    # Convenience: expose the worker prefix so executors can include it in logs.
+    env_items.append({"key": "RUNPOD_POD_NAME_PREFIX", "value": cfg.runpod_name_prefix})
     return env_items
 
 
 def try_create_one_pod(client: RunPodClient, cfg: Config) -> Dict[str, Any]:
     gpu_types = client.list_gpu_types()
 
+    # Build a resolved list of actual gpuTypeId strings to try.
     resolved: List[str] = []
     for token in cfg.gpu_ladder:
         match = client.resolve_gpu_type_id(gpu_types, token, min_vram_gb=48, disallow_blackwell=True)
@@ -232,9 +311,9 @@ def try_create_one_pod(client: RunPodClient, cfg: Config) -> Dict[str, Any]:
     if not resolved:
         raise RuntimeError("Could not resolve any GPU types from ladder; check RUNPOD_GPU_LADDER")
 
+    # We try: for gpu in resolved: for dc in [None] + datacenter_ladder
     dcs = [None] + (cfg.datacenter_ladder or [])
     last_err: Optional[BaseException] = None
-
     for gpu_type_id in resolved:
         for dc in dcs:
             name = f"{cfg.runpod_name_prefix}-{_rand_suffix()}"
@@ -267,34 +346,46 @@ def autoscaler_loop() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s][%(name)s] %(message)s",
     )
-
     cfg = load_config()
-    LOG.info("worker booting (runpod autoscaler)")
-    LOG.info("runpod_name_prefix=%s cloud_type=%s api_base=%s", cfg.runpod_name_prefix, cfg.runpod_cloud_type, cfg.runpod_api_base)
-
     client = RunPodClient(api_key=cfg.runpod_api_key, api_base=cfg.runpod_api_base)
     conn = psycopg.connect(cfg.database_url, autocommit=True)
 
-    # Log an initial DB probe so it’s obvious the loop is alive
-    backlog, inflight = get_backlog_and_inflight(conn, cfg.assigned_worker_id)
-    LOG.info("db ok (backlog=%s inflight=%s)", backlog, inflight)
-
-    backlog_zero_since: Optional[float] = None
+    # When we last observed any work (either backlog or inflight). Used for cooldown.
+    last_work_ts: float = time.time()
 
     while True:
         try:
-            backlog, inflight = get_backlog_and_inflight(conn, cfg.assigned_worker_id)
-            want = want_pods_for_backlog(backlog, cfg.backlog_per_pod)
+            released, failed = reap_stale_inflight(
+                conn,
+                assigned_worker_id=cfg.assigned_worker_id,
+                lease_seconds=cfg.lease_seconds,
+                max_attempts=cfg.max_attempts,
+            )
+            if released or failed:
+                LOG.info("reaped stale inflight jobs released=%s failed=%s", released, failed)
+
+            backlog, inflight = get_backlog_and_inflight(
+                conn,
+                assigned_worker_id=cfg.assigned_worker_id,
+                lease_seconds=cfg.lease_seconds,
+            )
+
+            # Floor pods at active inflight; backlog drives extra pods only when large enough.
+            want = max(inflight, want_pods_for_backlog(backlog, cfg.backlog_per_pod))
             want = min(want, cfg.max_pods)
 
             now = time.time()
-            if backlog == 0 and cfg.scale_down_grace_seconds > 0:
-                if backlog_zero_since is None:
-                    backlog_zero_since = now
-                if (now - backlog_zero_since) < cfg.scale_down_grace_seconds:
-                    want = max(want, 1)
-            else:
-                backlog_zero_since = None
+            if (backlog + inflight) > 0:
+                last_work_ts = now
+
+            # Cooldown: keep 1 pod warm for a short window after work finishes.
+            effective_cooldown = max(cfg.scale_down_grace_seconds, cfg.cooldown_seconds)
+            if want == 0 and effective_cooldown > 0:
+                if (now - last_work_ts) < effective_cooldown:
+                    # Only keep warm if we already have a pod; don't spin up a fresh one just for cooldown.
+                    pods_now = filter_managed_pods(client.list_pods(), cfg.runpod_name_prefix)
+                    if len(pods_now) > 0:
+                        want = 1
 
             pods = filter_managed_pods(client.list_pods(), cfg.runpod_name_prefix)
             have = len(pods)
@@ -311,6 +402,7 @@ def autoscaler_loop() -> None:
             elif have > want:
                 extra = have - want
                 LOG.info("terminating %s pod(s)", extra)
+                # Terminate newest first (smallest uptime), so older pods stay warm.
                 pods_sorted = sorted(pods, key=pod_uptime_seconds)
                 for p in pods_sorted[:extra]:
                     pid = p.get("id")
@@ -324,7 +416,7 @@ def autoscaler_loop() -> None:
 
         except (RunPodError, psycopg.Error) as e:
             LOG.error("autoscaler error: %s", e, exc_info=True)
-        except Exception:
+        except Exception as e:
             LOG.error("autoscaler error", exc_info=True)
 
         time.sleep(cfg.poll_seconds)
