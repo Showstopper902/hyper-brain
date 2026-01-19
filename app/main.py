@@ -99,9 +99,12 @@ RETURNING j.*
                 row = cur.fetchone()
                 if not row:
                     return {"job": None}
-                # psycopg returns tuples unless configured; map columns.
-                cols = [d.name for d in cur.description]
-                job = {cols[i]: row[i] for i in range(len(cols))}
+                # psycopg may return dict rows (when using dict_row) or tuples.
+                if isinstance(row, dict):
+                    job = row
+                else:
+                    cols = [d.name for d in cur.description]
+                    job = {cols[i]: row[i] for i in range(len(cols))}
                 return {"job": _row_to_job(job)}
     finally:
         conn.close()
