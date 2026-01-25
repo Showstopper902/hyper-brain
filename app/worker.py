@@ -71,13 +71,6 @@ class Config:
     poll_seconds: int
     scale_down_grace_seconds: int
 
-    # Lease/heartbeat-based cleanup for stuck inflight jobs
-    lease_seconds: int
-    max_attempts: int
-
-    # Keep a pod warm after backlog drains
-    cooldown_seconds: int
-
     # Pod resources
     container_disk_gb: int
     volume_gb: int
@@ -115,15 +108,10 @@ def load_config() -> Config:
     runpod_cloud_type = _env_str("RUNPOD_CLOUD_TYPE", "ALL")
     runpod_name_prefix = _env_str("RUNPOD_POD_NAME_PREFIX", "hyper-exec")
 
-    backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 250)
+    backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 10)
     max_pods = _env_int("RUNPOD_MAX_PODS", 25)
     poll_seconds = _env_int("RUNPOD_POLL_SECONDS", 5)
-    # Deprecated: prefer RUNPOD_COOLDOWN_SECONDS (kept for backward compat)
     scale_down_grace_seconds = _env_int("RUNPOD_SCALE_DOWN_GRACE_SECONDS", 0)
-
-    lease_seconds = _env_int("LEASE_SECONDS", 900)
-    max_attempts = _env_int("MAX_ATTEMPTS", 3)
-    cooldown_seconds = _env_int("COOLDOWN_SECONDS", 180)
 
     container_disk_gb = _env_int("RUNPOD_CONTAINER_DISK_GB", 50)
     volume_gb = _env_int("RUNPOD_VOLUME_GB", 80)
@@ -156,10 +144,6 @@ def load_config() -> Config:
         max_pods=max_pods,
         poll_seconds=poll_seconds,
         scale_down_grace_seconds=scale_down_grace_seconds,
-
-        lease_seconds=lease_seconds,
-        max_attempts=max_attempts,
-        cooldown_seconds=cooldown_seconds,
         container_disk_gb=container_disk_gb,
         volume_gb=volume_gb,
         min_vcpu=min_vcpu,
@@ -170,88 +154,17 @@ def load_config() -> Config:
     )
 
 
-def reap_stale_inflight(
-    conn: psycopg.Connection,
-    assigned_worker_id: str,
-    lease_seconds: int,
-    max_attempts: int,
-) -> Tuple[int, int]:
-    """Release or fail jobs that were claimed but stopped heartbeating.
-
-    Returns: (released_count, failed_count)
-    """
-    released = 0
-    failed = 0
-    # 1) fail jobs that have already exhausted attempts
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-               SET status = 'FAILED',
-                   finished_at = NOW(),
-                   error_text = COALESCE(error_text, '') ||
-                                CASE WHEN COALESCE(error_text,'') = '' THEN '' ELSE '\n' END ||
-                                'Lease expired (no heartbeat); max attempts exceeded',
-                   executor_id = NULL
-             WHERE assigned_worker_id = %s
-               AND status = 'RUNNING'
-               AND executor_id IS NOT NULL
-               AND COALESCE(heartbeat_at, claimed_at) < NOW() - (%s * INTERVAL '1 second')
-               AND COALESCE(attempts, 0) >= %s
-            """,
-            (assigned_worker_id, lease_seconds, max_attempts),
-        )
-        failed = cur.rowcount or 0
-    # 2) otherwise, release them back to backlog
-    with conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE jobs
-               SET executor_id = NULL,
-                   claimed_at = NULL,
-                   heartbeat_at = NULL,
-                   started_at = NULL,
-                   error_text = COALESCE(error_text, '') ||
-                                CASE WHEN COALESCE(error_text,'') = '' THEN '' ELSE '\n' END ||
-                                'Lease expired (no heartbeat); re-queued'
-             WHERE assigned_worker_id = %s
-               AND status = 'RUNNING'
-               AND executor_id IS NOT NULL
-               AND COALESCE(heartbeat_at, claimed_at) < NOW() - (%s * INTERVAL '1 second')
-               AND COALESCE(attempts, 0) < %s
-            """,
-            (assigned_worker_id, lease_seconds, max_attempts),
-        )
-        released = cur.rowcount or 0
-
-    if released or failed:
-        conn.commit()
-    return released, failed
-
-
-def get_backlog_and_inflight(
-    conn: psycopg.Connection,
-    assigned_worker_id: str,
-    lease_seconds: int,
-) -> Tuple[int, int]:
+def get_backlog_and_inflight(conn: psycopg.Connection, assigned_worker_id: str) -> Tuple[int, int]:
     with conn.cursor() as cur:
         cur.execute(
             """
             SELECT
               SUM(CASE WHEN status='RUNNING' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
-              SUM(
-                CASE
-                  WHEN status='RUNNING'
-                   AND executor_id IS NOT NULL
-                   AND COALESCE(heartbeat_at, claimed_at) >= NOW() - (%s * INTERVAL '1 second')
-                  THEN 1
-                  ELSE 0
-                END
-              ) AS inflight
+              COUNT(DISTINCT executor_id) FILTER (WHERE status='RUNNING' AND executor_id IS NOT NULL) AS inflight
             FROM jobs
             WHERE assigned_worker_id = %s
             """,
-            (lease_seconds, assigned_worker_id),
+            (assigned_worker_id,),
         )
         row = cur.fetchone()
         backlog = int(row[0] or 0)
@@ -350,42 +263,24 @@ def autoscaler_loop() -> None:
     client = RunPodClient(api_key=cfg.runpod_api_key, api_base=cfg.runpod_api_base)
     conn = psycopg.connect(cfg.database_url, autocommit=True)
 
-    # When we last observed any work (either backlog or inflight). Used for cooldown.
-    last_work_ts: float = time.time()
+    backlog_zero_since: Optional[float] = None
 
     while True:
         try:
-            released, failed = reap_stale_inflight(
-                conn,
-                assigned_worker_id=cfg.assigned_worker_id,
-                lease_seconds=cfg.lease_seconds,
-                max_attempts=cfg.max_attempts,
-            )
-            if released or failed:
-                LOG.info("reaped stale inflight jobs released=%s failed=%s", released, failed)
+            backlog, inflight = get_backlog_and_inflight(conn, cfg.assigned_worker_id)
+            want = max(inflight, int(math.ceil((inflight + backlog) / float(cfg.backlog_per_pod))))
 
-            backlog, inflight = get_backlog_and_inflight(
-                conn,
-                assigned_worker_id=cfg.assigned_worker_id,
-                lease_seconds=cfg.lease_seconds,
-            )
-
-            # Floor pods at active inflight; backlog drives extra pods only when large enough.
-            want = max(inflight, want_pods_for_backlog(backlog, cfg.backlog_per_pod))
             want = min(want, cfg.max_pods)
 
+            # Optional scale-down grace to avoid churn (disabled by default).
             now = time.time()
-            if (backlog + inflight) > 0:
-                last_work_ts = now
-
-            # Cooldown: keep 1 pod warm for a short window after work finishes.
-            effective_cooldown = max(cfg.scale_down_grace_seconds, cfg.cooldown_seconds)
-            if want == 0 and effective_cooldown > 0:
-                if (now - last_work_ts) < effective_cooldown:
-                    # Only keep warm if we already have a pod; don't spin up a fresh one just for cooldown.
-                    pods_now = filter_managed_pods(client.list_pods(), cfg.runpod_name_prefix)
-                    if len(pods_now) > 0:
-                        want = 1
+            if backlog == 0 and cfg.scale_down_grace_seconds > 0:
+                if backlog_zero_since is None:
+                    backlog_zero_since = now
+                if (now - backlog_zero_since) < cfg.scale_down_grace_seconds:
+                    want = max(want, 1)  # keep one warm pod
+            else:
+                backlog_zero_since = None
 
             pods = filter_managed_pods(client.list_pods(), cfg.runpod_name_prefix)
             have = len(pods)
