@@ -1,4 +1,5 @@
 import os
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -77,7 +78,7 @@ def executors_claim(payload: ClaimRequest, _: None = Depends(require_executor_au
 WITH candidate AS (
   SELECT job_id
   FROM jobs
-  WHERE status = 'RUNNING'
+  WHERE status = 'QUEUED'
     AND assigned_worker_id = %s
     AND executor_id IS NULL
   ORDER BY created_at ASC
@@ -85,7 +86,8 @@ WITH candidate AS (
   LIMIT 1
 )
 UPDATE jobs j
-SET executor_id = %s,
+SET status = 'RUNNING',
+    executor_id = %s,
     claimed_at = NOW(),
     heartbeat_at = NOW(),
     started_at = NOW(),
@@ -100,7 +102,7 @@ RETURNING j.*
                 if not row:
                     return {"job": None}
                 # psycopg may return dict rows (when using dict_row) or tuples.
-                if isinstance(row, dict):
+                if isinstance(row, Mapping):
                     job = row
                 else:
                     cols = [d.name for d in cur.description]

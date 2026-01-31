@@ -159,7 +159,7 @@ def get_backlog_and_inflight(conn: psycopg.Connection, assigned_worker_id: str) 
         cur.execute(
             """
             SELECT
-              SUM(CASE WHEN status='RUNNING' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
+              SUM(CASE WHEN status='QUEUED' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
               COUNT(DISTINCT executor_id) FILTER (WHERE status='RUNNING' AND executor_id IS NOT NULL) AS inflight
             FROM jobs
             WHERE assigned_worker_id = %s
