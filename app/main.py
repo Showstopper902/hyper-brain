@@ -1,5 +1,4 @@
 import os
-from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -79,14 +78,15 @@ WITH candidate AS (
   SELECT job_id
   FROM jobs
   WHERE status = 'QUEUED'
-    AND assigned_worker_id = %s
     AND executor_id IS NULL
+    AND (assigned_worker_id = %s OR assigned_worker_id IS NULL)
   ORDER BY created_at ASC
   FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
 UPDATE jobs j
 SET status = 'RUNNING',
+    assigned_worker_id = %s,
     executor_id = %s,
     claimed_at = NOW(),
     heartbeat_at = NOW(),
@@ -96,13 +96,13 @@ FROM candidate c
 WHERE j.job_id = c.job_id
 RETURNING j.*
                     """,
-                    (payload.assigned_worker_id, payload.executor_id),
+                    (payload.assigned_worker_id, payload.assigned_worker_id, payload.executor_id),
                 )
                 row = cur.fetchone()
                 if not row:
                     return {"job": None}
                 # psycopg may return dict rows (when using dict_row) or tuples.
-                if isinstance(row, Mapping):
+                if isinstance(row, dict):
                     job = row
                 else:
                     cols = [d.name for d in cur.description]

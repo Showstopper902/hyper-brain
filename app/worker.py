@@ -8,7 +8,7 @@ This worker does *not* execute jobs. It only:
 Scaling rule (default):
   - backlog = count(jobs where status='RUNNING' and executor_id is NULL
                    and assigned_worker_id matches this brain)
-  - want_pods = 0 if backlog == 0 else ceil(backlog / BACKLOG_PER_POD)
+  - want_pods = max(inflight, ceil((inflight + backlog) / BACKLOG_PER_POD))
 
 RunPod pods should run an "executor loop" container which calls:
   POST /executors/claim and POST /executors/complete on this brain.
@@ -162,7 +162,7 @@ def get_backlog_and_inflight(conn: psycopg.Connection, assigned_worker_id: str) 
               SUM(CASE WHEN status='QUEUED' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
               COUNT(DISTINCT executor_id) FILTER (WHERE status='RUNNING' AND executor_id IS NOT NULL) AS inflight
             FROM jobs
-            WHERE assigned_worker_id = %s
+            WHERE (assigned_worker_id = %s OR assigned_worker_id IS NULL)
             """,
             (assigned_worker_id,),
         )
