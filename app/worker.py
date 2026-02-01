@@ -108,7 +108,7 @@ def load_config() -> Config:
     runpod_cloud_type = _env_str("RUNPOD_CLOUD_TYPE", "ALL")
     runpod_name_prefix = _env_str("RUNPOD_POD_NAME_PREFIX", "hyper-exec")
 
-    backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 250)
+    backlog_per_pod = _env_int("RUNPOD_BACKLOG_PER_POD", 10)
     max_pods = _env_int("RUNPOD_MAX_PODS", 25)
     poll_seconds = _env_int("RUNPOD_POLL_SECONDS", 5)
     scale_down_grace_seconds = _env_int("RUNPOD_SCALE_DOWN_GRACE_SECONDS", 0)
@@ -154,35 +154,41 @@ def load_config() -> Config:
     )
 
 
-def get_backlog_and_inflight(conn, assigned_worker_id: str) -> tuple[int, int]:
-    """Returns (backlog, inflight).
-
-    backlog  = jobs waiting to be claimed (status='QUEUED') for this worker pool (or unassigned).
-    inflight = distinct active executor_ids currently running jobs for this worker pool.
-    """
+def get_backlog_and_inflight(conn: psycopg.Connection, assigned_worker_id: str) -> Tuple[int, int]:
     with conn.cursor() as cur:
         cur.execute(
             """
-SELECT
-  (SELECT COUNT(*)
-     FROM jobs
-    WHERE status = 'QUEUED'
-      AND (assigned_worker_id IS NULL OR assigned_worker_id = %s)
-  ) AS backlog,
-  (SELECT COUNT(DISTINCT executor_id)
-     FROM jobs
-    WHERE status = 'RUNNING'
-      AND assigned_worker_id = %s
-      AND executor_id IS NOT NULL
-  ) AS inflight
+            SELECT
+              SUM(CASE WHEN status='QUEUED' AND executor_id IS NULL THEN 1 ELSE 0 END) AS backlog,
+              COUNT(DISTINCT executor_id) FILTER (WHERE status='RUNNING' AND executor_id IS NOT NULL) AS inflight
+            FROM jobs
+            WHERE (assigned_worker_id = %s OR assigned_worker_id IS NULL)
             """,
-            (assigned_worker_id, assigned_worker_id),
+            (assigned_worker_id,),
         )
         row = cur.fetchone()
-        if not row:
-            return 0, 0
-        backlog, inflight = int(row[0] or 0), int(row[1] or 0)
+        backlog = int(row[0] or 0)
+        inflight = int(row[1] or 0)
         return backlog, inflight
+
+
+def want_pods_for_backlog(backlog: int, backlog_per_pod: int) -> int:
+    if backlog <= 0:
+        return 0
+    return int(math.ceil(backlog / float(backlog_per_pod)))
+
+
+def filter_managed_pods(pods: List[Dict[str, Any]], name_prefix: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for p in pods:
+        name = (p.get("name") or "")
+        if not name.startswith(name_prefix):
+            continue
+        status = (p.get("desiredStatus") or "").upper()
+        if status in {"TERMINATED", "DELETED"}:
+            continue
+        out.append(p)
+    return out
 
 
 def pod_uptime_seconds(p: Dict[str, Any]) -> int:
@@ -262,7 +268,8 @@ def autoscaler_loop() -> None:
     while True:
         try:
             backlog, inflight = get_backlog_and_inflight(conn, cfg.assigned_worker_id)
-            want = want_pods_for_backlog(backlog, cfg.backlog_per_pod)
+            want = max(inflight, int(math.ceil((inflight + backlog) / float(cfg.backlog_per_pod))))
+
             want = min(want, cfg.max_pods)
 
             # Optional scale-down grace to avoid churn (disabled by default).
