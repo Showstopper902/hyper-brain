@@ -144,8 +144,11 @@ RETURNING j.*
                 if not row:
                     return {"job": None}
 
-                cols = [d.name for d in cur.description]
-                job = {cols[i]: row[i] for i in range(len(cols))}
+                if isinstance(row, Mapping):
+                    job = dict(row)
+                else:
+                    cols = [d.name for d in cur.description]
+                    job = {cols[i]: row[i] for i in range(len(cols))}
                 job.update(_build_cmd(job, payload.capabilities or {}))
                 return {"job": _row_to_job(job)}
     finally:
