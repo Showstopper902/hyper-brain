@@ -1,5 +1,6 @@
 import os
 from typing import Any, Dict, Optional
+from collections.abc import Mapping
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from pydantic import BaseModel
