@@ -129,7 +129,7 @@ def load_config() -> Config:
     # Keep this list tight—only secrets/values the executor needs.
     pod_env_passthrough = [s.strip() for s in _env_str(
         "RUNPOD_POD_ENV_PASSTHROUGH",
-        "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION",
+        "EXECUTOR_TOKEN,BRAIN_URL,ASSIGNED_WORKER_ID,B2_S3_ENDPOINT,B2_BUCKET,AWS_ACCESS_KEY_ID,AWS_SECRET_ACCESS_KEY,AWS_DEFAULT_REGION,MINIMAX_API_KEY",
     ).split(",") if s.strip()]
 
     return Config(
