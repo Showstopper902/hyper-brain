@@ -72,16 +72,6 @@ def _build_cmd(job: dict, capabilities: dict) -> dict:
         if not song_name:
             raise HTTPException(status_code=422, detail="INFER_SONG job missing song_name")
         env["SONG_NAME"] = song_name
-        # NOTE (temporary): While we're creating INFER_SONG jobs directly in Supabase (pre-Base44),
-        # pass MiniMax prompt/lyrics/settings via env so the RunPod executor can call the API.
-        # When Base44 creates the job/env contract directly, this block may be removed.
-        env["MINIMAX_LYRICS"] = str(job.get("lyrics") or "")
-        env["MINIMAX_PROMPT"] = str(job.get("prompt_full") or job.get("prompt_user") or "")
-        env["MINIMAX_MODEL"] = str(job.get("minimax_model") or "music-2.5")
-        env["MINIMAX_OUTPUT_FORMAT"] = "url"
-        env["MINIMAX_AUDIO_FORMAT"] = str(job.get("minimax_audio_format") or "mp3")
-        env["MINIMAX_SAMPLE_RATE"] = str(job.get("minimax_sample_rate") or 44100)
-        env["MINIMAX_BITRATE"] = str(job.get("minimax_bitrate") or 256000)
         # Use the UVR Python interpreter to run the combined pipeline.  This interpreter has requests,
         # awscli and audio-separator installed.  The script will orchestrate UVR and RVC using the
         # interpreters specified in the RVC_PYTHON and UVR_PYTHON environment variables.
