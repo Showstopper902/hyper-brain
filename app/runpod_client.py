@@ -16,6 +16,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+import random
+import time
+
 import requests
 
 
@@ -29,8 +32,13 @@ class RunPodClient:
     api_base: str = "https://api.runpod.io"
     timeout_s: int = 60
 
+    # Retry knobs (kept conservative; Fly networking can be spiky)
+    max_attempts: int = 5
+    backoff_s: float = 0.8  # base backoff; grows exponentially
+
     def __post_init__(self) -> None:
         self.endpoint = self.api_base.rstrip("/") + "/graphql"
+        self.session = requests.Session()
 
     def _gql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         headers = {
@@ -41,14 +49,46 @@ class RunPodClient:
         if variables is not None:
             payload["variables"] = variables
 
-        r = requests.post(self.endpoint, json=payload, headers=headers, timeout=self.timeout_s)
-        if not r.ok:
-            raise RunPodError(f"RunPod HTTP {r.status_code}: {r.text[:500]}")
-        data = r.json()
-        if "errors" in data and data["errors"]:
-            msg = data["errors"][0].get("message") or str(data["errors"][0])
-            raise RunPodError(f"RunPod GraphQL error: {msg}")
-        return data.get("data") or {}
+        last_err: Optional[BaseException] = None
+
+        for attempt in range(1, self.max_attempts + 1):
+            try:
+                r = self.session.post(
+                    self.endpoint,
+                    json=payload,
+                    headers=headers,
+                    timeout=self.timeout_s,
+                )
+
+                # Retry on common transient HTTP statuses
+                if r.status_code in (429, 500, 502, 503, 504):
+                    if attempt < self.max_attempts:
+                        sleep_s = (self.backoff_s * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
+                        time.sleep(sleep_s)
+                        continue
+                    raise RunPodError(f"RunPod HTTP {r.status_code}: {r.text[:500]}")
+
+                if not r.ok:
+                    raise RunPodError(f"RunPod HTTP {r.status_code}: {r.text[:500]}")
+
+                data = r.json()
+                if "errors" in data and data["errors"]:
+                    msg = data["errors"][0].get("message") or str(data["errors"][0])
+                    raise RunPodError(f"RunPod GraphQL error: {msg}")
+
+                return data.get("data") or {}
+
+            except requests.exceptions.RequestException as e:
+                # Covers TLS handshake resets, ConnectionResetError, etc.
+                last_err = e
+                if attempt < self.max_attempts:
+                    sleep_s = (self.backoff_s * (2 ** (attempt - 1))) + random.uniform(0, 0.25)
+                    time.sleep(sleep_s)
+                    continue
+                raise RunPodError(f"RunPod request failed after {self.max_attempts} attempts: {e}") from e
+
+        # Should never reach here
+        raise RunPodError(f"RunPod request failed: {last_err}")
 
     # ---------- Queries ----------
 
