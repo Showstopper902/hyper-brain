@@ -8,6 +8,9 @@ primary_region = 'ord'
 
 [build]
 
+[processes]
+  worker = "python -m app.worker"
+
 [[vm]]
   cpu_kind = 'shared'
   cpus = 1
