@@ -152,7 +152,7 @@ def _row_to_job(row: Dict[str, Any]) -> Dict[str, Any]:
 
 @app.post("/executors/claim")
 def executors_claim(payload: ClaimRequest, _: None = Depends(require_executor_auth)):
-    """Claim the oldest QUEUED job for this worker pool."""
+    """Claim the oldest QUEUED job for this worker pool (or reclaim a stale RUNNING job)."""
     conn = get_conn()
     try:
         with conn:
@@ -162,8 +162,18 @@ def executors_claim(payload: ClaimRequest, _: None = Depends(require_executor_au
 WITH candidate AS (
   SELECT job_id
   FROM jobs
-  WHERE status = 'QUEUED'
-    AND (assigned_worker_id IS NULL OR assigned_worker_id = %s)
+  WHERE
+    (
+      status = 'QUEUED'
+      AND (assigned_worker_id IS NULL OR assigned_worker_id = %s)
+    )
+    OR
+    (
+      status = 'RUNNING'
+      AND heartbeat_at IS NOT NULL
+      AND heartbeat_at < NOW() - INTERVAL '3 minutes'
+      AND (assigned_worker_id IS NULL OR assigned_worker_id = %s)
+    )
   ORDER BY created_at ASC
   FOR UPDATE SKIP LOCKED
   LIMIT 1
@@ -180,7 +190,12 @@ FROM candidate c
 WHERE j.job_id = c.job_id
 RETURNING j.*
                     """,
-                    (payload.assigned_worker_id, payload.executor_id, payload.assigned_worker_id),
+                    (
+                        payload.assigned_worker_id,
+                        payload.assigned_worker_id,
+                        payload.executor_id,
+                        payload.assigned_worker_id,
+                    ),
                 )
                 row = cur.fetchone()
                 if not row:
