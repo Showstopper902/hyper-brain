@@ -113,8 +113,17 @@ def load_config() -> Config:
     poll_seconds = _env_int("RUNPOD_POLL_SECONDS", 5)
     scale_down_grace_seconds = _env_int("RUNPOD_SCALE_DOWN_GRACE_SECONDS", 0)
 
-    container_disk_gb = _env_int("RUNPOD_CONTAINER_DISK_GB", 50)
-    volume_gb = _env_int("RUNPOD_VOLUME_GB", 80)
+    # ----------------------------------------------------------------------
+    # Pod resources
+    #
+    # We set default container_disk_gb to 10 and volume_gb to 0. These values
+    # mirror the user's desired minimal RunPod footprint: we only keep enough
+    # container disk for temp data and avoid allocating any persistent volume.
+    # If environment variables RUNPOD_CONTAINER_DISK_GB or RUNPOD_VOLUME_GB are
+    # set, they will override these defaults, preserving backward compatibility.
+    # ----------------------------------------------------------------------
+    container_disk_gb = _env_int("RUNPOD_CONTAINER_DISK_GB", 10)
+    volume_gb = _env_int("RUNPOD_VOLUME_GB", 0)
     min_vcpu = _env_int("RUNPOD_MIN_VCPU", 4)
     min_mem_gb = _env_int("RUNPOD_MIN_MEM_GB", 16)
 
